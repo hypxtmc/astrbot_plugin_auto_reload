@@ -101,7 +101,7 @@ def _plugin_name_hint(query, registry, reason: str = "") -> str:
 
 
 @register(
-    "astrbot_plugin_manager",
+    "astrbot_plugin_auto_reload",
     "hypxtmc",
     "在聊天中管理 AstrBot 插件：查看列表、启停、重载（含平台换手/陈旧任务回收/生效度评分）、安装、卸载、更新",
     "1.0.2",
@@ -315,7 +315,7 @@ class PluginManager(Star):
         """卸载插件  用法：/plugin uninstall <插件名>"""
 
         # 防止卸载自己
-        if name == "astrbot_plugin_manager":
+        if name == "astrbot_plugin_auto_reload":
             yield event.plain_result("❌ 不能卸载插件管理助手本身（需要先手动禁用本插件）")
             return
 
@@ -1517,7 +1517,7 @@ class PluginManager(Star):
     def _snapshot_dir(self) -> str:
         import os as _os
         return _os.path.abspath(
-            _os.path.join("data", "plugin_data", "astrbot_plugin_manager", "subagent_snapshots")
+            _os.path.join("data", "plugin_data", "astrbot_plugin_auto_reload", "subagent_snapshots")
         )
 
     def _rt_handoff_map(self) -> dict:
