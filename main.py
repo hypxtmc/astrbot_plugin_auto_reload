@@ -108,7 +108,7 @@ def _plugin_name_hint(query, registry, reason: str = "") -> str:
     "",
 )
 class PluginManager(Star):
-    """插件手术台 - 通过聊天指令管理 AstrBot 插件，支持深度热重载"""
+    """自动重载 - 为 AI agent 设计的插件管理与自主热重载，人类也可用聊天指令操作"""
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -1797,4 +1797,4 @@ class PluginManager(Star):
         return f"🎤 {name} 试音回复（provider={prov_id or '默认'}）：\n{shown}"
 
     async def terminate(self):
-        logger.info("[插件手术台] 插件已卸载")
+        logger.info("[自动重载] 插件已卸载")
