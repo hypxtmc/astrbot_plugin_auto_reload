@@ -1,6 +1,6 @@
 name: astrbot_plugin_manager
-display_name: 插件手术台
-description: 在聊天中管理 AstrBot 插件：查看列表、启停、重载（含平台换手/陈旧任务回收/生效度评分）、安装、卸载、更新
+display_name: 自动重载
+description: 为 AI agent 设计的插件管理与自主热重载：自证回执、生效度评分、平台实例换手、陈旧任务回收、子代理三件套；人类同样可用 /plugin 指令操作
 version: 1.0.2
 author: hypxtmc
 # 无 repo 字段：本插件为本地深度重构版，不设远程更新源。
