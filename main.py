@@ -104,7 +104,7 @@ def _plugin_name_hint(query, registry, reason: str = "") -> str:
     "astrbot_plugin_manager",
     "hypxtmc",
     "在聊天中管理 AstrBot 插件：查看列表、启停、重载（含平台换手/陈旧任务回收/生效度评分）、安装、卸载、更新",
-    "1.0.0",
+    "1.0.2",
     "",
 )
 class PluginManager(Star):
@@ -468,7 +468,7 @@ class PluginManager(Star):
         except Exception:
             allowed = False
         if not (allowed or _is_owner(event, self.config.get("owner_uids"))):
-            return "权限不足：仅管理员/博士可调用"
+            return "权限不足：仅管理员或配置的所有者可调用"
 
         target_all = str(name).strip().lower() == "all"
         plugin_key = None
@@ -479,7 +479,7 @@ class PluginManager(Star):
                 return f"❌ 未找到插件「{name}」\n{e}"
 
         before = self._snapshot_star(plugin_key) if plugin_key else {}
-        # 深度清理模块缓存（2026-09-11 博士拍板）：AstrBot 的 reload 走 __import__，
+        # 深度清理模块缓存：AstrBot 的 reload 走 __import__，
         # sys.modules 里已缓存的子模块不会被清（核心的模块名前缀匹配与运行时
         # 模块名对不上），导致 router.py/dispatch.py/memory.py 这类拆分子模块的
         # 改动“重载成功但代码不生效”。这里按内部名/文件路径精确挖掉，强制重读盘。
@@ -523,7 +523,7 @@ class PluginManager(Star):
                 rebind_note = self._audit_and_rebind(plugin_key)
             except Exception as _rb_e:
                 rebind_note = f"\n⚠️ 绑定自检异常：{type(_rb_e).__name__}: {_rb_e}"
-        # ── 二期（2026-09-13 博士拍板）：平台适配器实例换手 ──
+        # ── 二期：平台适配器实例换手 ──
         # 默认关闭（开关 handover_platforms），只在明确要换血时开。
         # 时序刻意放在「新代码已加载」之后：先重载拿到新类，再停旧实例、用新类
         # 重挂，把断线窗口压到只剩重连那一瞬 —— 而不是反过来让通道断整个重载期。
@@ -537,7 +537,7 @@ class PluginManager(Star):
                     handover_note = await self._handover_plugin_platforms(plugin_key)
                 except Exception as _ho_e:
                     handover_note = f"\n⚠️ 平台换手异常：{type(_ho_e).__name__}: {_ho_e}"
-        # ── 三期（2026-09-13 博士拍板）：陈旧后台任务回收 ──
+        # ── 三期：陈旧后台任务回收 ──
         # 二期按生命周期停掉的只有「适配器自带的」任务；插件在自己代码里
         # create_task 起的（定时器/巡检/重试循环）没有登记表，谁也停不掉，
         # 只能靠 ④ 的判据认出来再取消。默认关闭（reclaim_tasks）。
@@ -551,12 +551,12 @@ class PluginManager(Star):
                     reclaim_note = await self._reclaim_plugin_tasks(plugin_key)
                 except Exception as _rc_e:
                     reclaim_note = f"\n⚠️ 任务回收异常：{type(_rc_e).__name__}: {_rc_e}"
-        # ── 长活对象自检（2026-09-13 博士拍板做第④条）──
+        # ── 长活对象自检 ──
         # 绑定自检只能看“注册表里的新绑定”，看不了“已经在跑的老链路”。
         # 今天 qq_restapi 语音事件走的正是后者：模块缓存清了、绑定也无孤儿，
         # 但 WS 派发任务与平台适配器实例仍持着旧模块的 globals，事件进来
         # 还是执行旧代码。这里把这类持有者揪出来写进回执，把“假成功”
-        # 从“需要博士发消息去试”变成“回执直接明说”。
+        # 从“需要人工发消息去试”变成“回执直接明说”。
         live_note = ""
         if plugin_key and success:
             try:
@@ -567,7 +567,7 @@ class PluginManager(Star):
             plugin_key, target_all, success, error_message,
             elapsed, before, after, capture.lines, len(purged),
         )
-        # ── 一期（2026-09-13 博士拍板）：生效度评分 + 必须重启清单 ──
+        # ── 一期：生效度评分 + 必须重启清单 ──
         # 两个自检只能回答“有没有陈旧引用”，回答不了“这次重载到底算不算成功”。
         # 这里再补两样，都是纯回执增强、不碰 core：
         #   ① astrbot/core 下有没有「源文件比 .pyc 新」的模块——有就说明那份改动
@@ -1428,7 +1428,7 @@ class PluginManager(Star):
         except Exception:
             allowed = False
         if not (allowed or _is_owner(event, self.config.get("owner_uids"))):
-            return "权限不足：仅管理员/博士可调用"
+            return "权限不足：仅管理员或配置的所有者可调用"
 
         act = str(action).strip().lower()
         name = str(name).strip()
@@ -1512,7 +1512,7 @@ class PluginManager(Star):
         who = "创建人格并" if created else ""
         act_word = "更新" if replaced else "新增"
         return f"✅ 已{act_word}子代理「{name}」（{who}persona={pid}），即时生效"
-    # ── 子代理三件套（2026-09-13 博士拍板）：体检 / 快照 / 试音 ──
+    # ── 子代理三件套：体检 / 快照 / 试音 ──
 
     def _snapshot_dir(self) -> str:
         import os as _os
@@ -1546,7 +1546,7 @@ class PluginManager(Star):
         except Exception:
             allowed = False
         if not (allowed or _is_owner(event, self.config.get("owner_uids"))):
-            return "权限不足：仅管理员/博士可调用"
+            return "权限不足：仅管理员或配置的所有者可调用"
 
         pm = self._get_persona_mgr()
         cfg = self._get_orch_config()
@@ -1624,7 +1624,7 @@ class PluginManager(Star):
         except Exception:
             allowed = False
         if not (allowed or _is_owner(event, self.config.get("owner_uids"))):
-            return "权限不足：仅管理员/博士可调用"
+            return "权限不足：仅管理员或配置的所有者可调用"
 
         import json as _json
         import os as _os
@@ -1750,7 +1750,7 @@ class PluginManager(Star):
         except Exception:
             allowed = False
         if not (allowed or _is_owner(event, self.config.get("owner_uids"))):
-            return "权限不足：仅管理员/博士可调用"
+            return "权限不足：仅管理员或配置的所有者可调用"
 
         import asyncio as _aio
         from datetime import datetime as _dt
