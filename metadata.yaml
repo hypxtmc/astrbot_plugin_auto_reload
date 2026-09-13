@@ -1,5 +1,5 @@
 name: astrbot_plugin_manager
-display_name: 自动重载
+display_name: 插件手术台
 description: 为 AI agent 设计的插件管理与自主热重载：自证回执、生效度评分、平台实例换手、陈旧任务回收、子代理三件套；人类同样可用 /plugin 指令操作
 version: 1.0.2
 author: hypxtmc
