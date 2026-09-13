@@ -72,7 +72,7 @@ AstrBot 自带的插件重载只做一件事：清模块缓存、重新 import�
 如果你在用 AstrBot 的子代理编排，这三个工具把"改完人格不知道改没改上"变成可验证的事：
 
 - **🩺 `subagent_health` 运行时体检**——对照四层抓异常：编制表（config）↔ 运行时实例（handoffs）↔ 人格源（persona DB）↔ provider 可用性。专治：在编但未挂载、人格缺失导致的串台回落、改人格后没重载（运行时还跑旧 instructions）、provider 失效。单次体检输出逐项核对结果（实测 11 项全绿示例见下）
-- **📸 `subagent_snapshot` 编制快照**——`save` 一次性备份 orchestrator 配置段 + 全部相关人格（prompt / begin_dialogs / tools）；`list` 列历史；`rollback` 一键恢复（人格存在才恢复，不存在跳过并明示，不做半恢复）。存于 `data/plugin_data/astrbot_plugin_manager/subagent_snapshots/`，纯本地
+- **📸 `subagent_snapshot` 编制快照**——`save` 一次性备份 orchestrator 配置段 + 全部相关人格（prompt / begin_dialogs / tools）；`list` 列历史；`rollback` 一键恢复（人格存在才恢复，不存在跳过并明示，不做半恢复）。存于 `data/plugin_data/astrbot_plugin_auto_reload/subagent_snapshots/`，纯本地
 - **🎤 `subagent_test` 试音台**——用子代理的人格与 provider 直接发一条测试消息，拿回原始回复（不转发给用户）。调人格时改一段试一段，session 隔离不留上下文，60s 超时
 
 不用子代理功能？配置里把 `enable_subagent_tools` 关掉，这四个工具（含 `update_subagent`）整体消失，不占工具列表。
