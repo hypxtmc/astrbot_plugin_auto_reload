@@ -1,0 +1,8 @@
+name: astrbot_plugin_manager
+display_name: 插件手术台
+description: 在聊天中管理 AstrBot 插件：查看列表、启停、重载（含平台换手/陈旧任务回收/生效度评分）、安装、卸载、更新
+version: 1.0.2
+author: hypxtmc
+# 无 repo 字段：本插件为本地深度重构版，不设远程更新源。
+# /plugin update 会明确拒绝（防止误拉原作者仓库覆盖本地魔改）。
+astrbot_version: ">=4.16,<5"

@@ -1,0 +1,38 @@
+{
+  "allow_install": {
+    "description": "是否允许通过聊天指令安装插件",
+    "type": "bool",
+    "hint": "开启后可使用 /plugin install <github_url> 安装插件。注意：安装插件会执行 pip install，请确保来源可信。",
+    "default": false
+  },
+  "allow_uninstall": {
+    "description": "是否允许通过聊天指令卸载插件",
+    "type": "bool",
+    "hint": "开启后可使用 /plugin uninstall <插件名> 卸载插件。卸载后插件代码将被删除，请谨慎开启。",
+    "default": false
+  },
+  "enable_subagent_tools": {
+    "description": "启用子代理相关 LLM 工具",
+    "type": "bool",
+    "hint": "关闭后 update_subagent / subagent_health / subagent_snapshot / subagent_test 四个工具停用（不使用子代理功能的实例可关闭）",
+    "default": true
+  },
+  "owner_uids": {
+    "description": "所有者用户 ID 列表（免 ADMIN 放行）",
+    "type": "list",
+    "hint": "填写后，列表内的用户即使无 ADMIN 权限也可调用管理类 LLM 工具（热重载/插件操作/子代理三件套）。留空则仅 ADMIN 可用。",
+    "default": []
+  },
+  "hot_reload_handover_default": {
+    "description": "热重载默认执行平台实例换手",
+    "type": "bool",
+    "hint": "开启后每次热重载「平台适配器型」插件时自动停掉旧实例、按新代码重挂（治重载后仍走旧代码）。代价：通道断线重连约 1 秒，期间消息可能丢。工具调用时显式传 handover_platforms 参数可按次覆盖。默认关闭。",
+    "default": false
+  },
+  "hot_reload_reclaim_default": {
+    "description": "热重载默认回收陈旧后台任务",
+    "type": "bool",
+    "hint": "开启后每次热重载时自动取消该插件自己 create_task 起、且仍跑旧代码的后台任务（定时器/巡检/重试循环）。只杀持旧模块代码的任务，新任务不受影响。建议先看回执 🧬 行报不报陈旧，再决定开不开。工具调用时显式传 reclaim_tasks 参数可按次覆盖。默认关闭。",
+    "default": false
+  }
+}
