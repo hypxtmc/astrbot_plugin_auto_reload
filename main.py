@@ -104,7 +104,7 @@ def _plugin_name_hint(query, registry, reason: str = "") -> str:
     "astrbot_plugin_auto_reload",
     "hypxtmc",
     "在聊天中管理 AstrBot 插件：查看列表、启停、重载（含平台换手/陈旧任务回收/生效度评分）、安装、卸载、更新",
-    "1.0.2",
+    "1.0.3-m3fix",
     "",
 )
 class PluginManager(Star):
@@ -1374,6 +1374,14 @@ class PluginManager(Star):
 
     async def _ensure_persona(self, persona_id, persona_prompt=None, description=None):
         """确保 persona 存在于内存/DB，不存在则创建（可带 prompt）。返回 (existed, persona)"""
+        # 支持 file: 前缀从文件读取 prompt——大 prompt 走 LLM 工具参数会被截断，必须走文件
+        if persona_prompt and persona_prompt.startswith("file:"):
+            _fp = persona_prompt[5:].strip()
+            try:
+                with open(_fp, "r", encoding="utf-8") as _f:
+                    persona_prompt = _f.read()
+            except OSError as _e:
+                raise ValueError(f"无法读取 prompt 文件 {_fp}: {_e}")
         mgr = self._get_persona_mgr()
         existing = mgr.get_persona_v3_by_id(persona_id) if persona_id else None
         # v3 可能查不到但 DB 里有，再兜底一次
@@ -1387,6 +1395,27 @@ class PluginManager(Star):
             except Exception:
                 pass
         if existing is not None:
+            # persona_prompt 提供且与现值不同 → 更新既有人格（否则改人格只能靠删了重建）
+            if persona_prompt:
+                cur_prompt = None
+                _diag = []
+                try:
+                    allp = await mgr.get_all_personas()
+                    _diag.append(f"allp={len(allp)}")
+                    for p in allp:
+                        if p.persona_id == persona_id:
+                            cur_prompt = getattr(p, "system_prompt", None)
+                            if cur_prompt is None and isinstance(p, dict):
+                                cur_prompt = p.get("system_prompt")
+                            _diag.append(f"matched len={len(cur_prompt) if cur_prompt else 0}")
+                            break
+                except Exception as _e:
+                    _diag.append(f"ERR {_type_err := type(_e).__name__}:{_e}")
+                logger.info(f"[子代理热更新] 更新人格诊断 {persona_id}: {'; '.join(_diag)}; new_len={len(persona_prompt)}; will_update={cur_prompt is not None and cur_prompt != persona_prompt}")
+                if cur_prompt is not None and cur_prompt != persona_prompt:
+                    await mgr.update_persona(persona_id, system_prompt=persona_prompt)
+                    from astrbot.api import logger as _lg2
+                    _lg2.info(f"[子代理热更新] 已更新人格 {persona_id} 的 system_prompt")
             return False, existing
         # 创建
         prompt = persona_prompt or description or f"你是{persona_id}。"
@@ -1418,7 +1447,7 @@ class PluginManager(Star):
             persona_id (string): 中文人格名（默认同 name）。upsert 时若该人格不存在会自动创建。
             public_description (string): 主代理路由描述（子代理用途/触发场景，给路由判断用）。
             provider_id (string): 该子代理用的模型提供商 id（如 opencode-go/mimo-v2.5）。留空用默认。
-            persona_prompt (string): upsert 且需要新建人格时，可一并写入系统人格 prompt。
+            persona_prompt (string): upsert 时写入系统人格 prompt。人格不存在则新建；已存在且内容有变化则更新（可借此修改人格设定）。
             config (dict): 可选，额外 orchestrator 字段（如 enabled=false 禁用、tools 列表等）。
         """
         if not self.config.get("enable_subagent_tools", True):
