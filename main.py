@@ -1406,6 +1406,65 @@ class PluginManager(Star):
         hits.sort(reverse=True)
         return [rel for _mt, rel in hits[:limit]]
 
+    def _tag_freshness(self, plugin_key: str):
+        """runtime build 指纹判据（2026-09-16 00:26 假绿防护·硬判据）。
+
+        判据：子模块类必须带 RUNTIME_BUILD_TAG 常量（如 dispatch.py 开头:
+        RUNTIME_BUILD_TAG = "build-2026-09-16-0026-r10"）。
+        内存 star_cls_type 的 MRO 上类属性 tag 与磁盘同名源文件的 tag 比对，
+        不一致即内存跑的是旧类（假绿），必须重启才能换血。
+        保守：子模块未打指纹 → 跳过（ok=None），不误报。
+        """
+        try:
+            import inspect as _insp
+            import re as _re
+            import sys as _sb
+            _star_mod = _sb.modules.get("astrbot.core.star.star")
+            _map = getattr(_star_mod, "star_map", None)
+            if not _map:
+                return {"ok": None}
+            meta = None
+            kl = (plugin_key or "").lower()
+            for path, m in _map.items():
+                if kl in str(path).lower():
+                    meta = m
+                    break
+            if meta is None:
+                return {"ok": None}
+            cls = getattr(meta, "star_cls_type", None)
+            if cls is None:
+                return {"ok": None}
+            for klass in _insp.getmro(cls):
+                kmod = getattr(klass, "__module__", None)
+                if not kmod or not kmod.startswith("data.plugins"):
+                    continue
+                mem_tag = getattr(klass, "RUNTIME_BUILD_TAG", None)
+                if mem_tag is None:
+                    continue
+                fpath = _insp.getsourcefile(klass)
+                if not fpath:
+                    continue
+                try:
+                    with open(fpath, encoding="utf-8") as _fh:
+                        disk_src = _fh.read()
+                except Exception:
+                    continue
+                m2 = _re.search(
+                    r"RUNTIME_BUILD_TAG\s*=\s*['\"]([^'\"]+)['\"]", disk_src
+                )
+                if not m2:
+                    continue
+                if m2.group(1) != mem_tag:
+                    return {
+                        "ok": False,
+                        "stale": [
+                            f"{kmod}: RUNTIME_BUILD_TAG 内存={mem_tag} / 磁盘={m2.group(1)}"
+                        ],
+                    }
+            return {"ok": True}
+        except Exception as _e:
+            return {"ok": None, "err": f"{type(_e).__name__}: {_e}"}
+
     def _runtime_self_stale(self, plugin_key: str):
         """热重载后「类方法血」运行时验证（2026-09-16 00:02 产品化）。
 
@@ -1514,7 +1573,9 @@ class PluginManager(Star):
         # ── 2026-09-16 第五层：运行时类方法换血验证（假绿防护） ──
         # 兼容缺省 plugin_key：只有显式指定插件重载时才做，全量重载不做（怕拖慢回执）。
         if plugin_key and success:
-            _rt = self._runtime_self_stale(plugin_key)
+            _rt = self._tag_freshness(plugin_key)
+            if _rt.get("ok") is None:
+                _rt = self._runtime_self_stale(plugin_key)
             if _rt.get("ok") is False:
                 head = (
                     "🧭 生效度：⚠️ 部分生效——模块/绑定已换血，但运行时类方法仍是旧版本"
