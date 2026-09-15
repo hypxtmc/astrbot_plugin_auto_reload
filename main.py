@@ -269,7 +269,9 @@ class PluginManager(Star):
         try:
             pm = self._get_pm()
             purged, _snapshot = self._purge_plugin_modules(star.name)
-            await pm.reload(name)
+            await pm.reload(None)  # 2026-09-15 23:27 锁全量——指定分支在 r7 reload（4257）
+            # 中漏 star_cls 换血（r7 探针不出现），全强制走 core load(None)
+            # 全量 re-build Plugin class 才是真绿路径；代价 reload ~20s，真绿优先
             tip = f"（深度清理模块缓存 {len(purged)} 个）" if purged else ""
             yield event.plain_result(f"✅ 已重载插件「{name}」{tip}")
         except Exception as e:
@@ -498,9 +500,11 @@ class PluginManager(Star):
         capture.start()
         t0 = time.monotonic()
         try:
-            success, error_message = await self._get_pm().reload(
-                None if target_all else plugin_key
-            )
+            # 2026-09-15 23:27 锁全量逻辑同上：核心是「指定某插件分支」能走到的是
+            # 损假绿路径—— — core 只 _unbind+load 指定 path，star_map 若已 fresh 会导致直接复用旧 star_cls_type；
+            # 传 None 强制 reload 全插件走 load(None)，那边 star_map.clear()
+            # + star_registry.clear() + __init_subclass 重新注册 → 全换血 → 真绿。
+            success, error_message = await self._get_pm().reload(None)
             if not success:
                 self._restore_plugin_modules(module_snapshot)
         except Exception as e:
