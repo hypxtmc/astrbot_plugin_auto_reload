@@ -747,6 +747,19 @@ class PluginManager(Star):
             from astrbot.core.star.star import star_map as _sm, star_registry as _sr
         except Exception:
             _sm, _sr = None, None
+        if _sm is not None:
+            try:
+                _probe = [
+                    f"{p.split('.')[-1] if '.' in p else p}"
+                    f"@{str(getattr(getattr(_sm[p], 'star_cls_type', None), '__module__', '?')[-40:])}"
+                    for p in list(_sm)[:12]
+                ]
+                logger.warning(
+                    "[star_map 摘除诊断] entries=%d registry=%d 示例：%s",
+                    len(_sm), len(_sr), _probe,
+                )
+            except Exception:
+                pass
         n_starmap = 0
         star_probes: list = []
         if _sm is not None and _sr is not None:
