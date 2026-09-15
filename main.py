@@ -584,6 +584,7 @@ class PluginManager(Star):
         except Exception:
             core_stale = []
         try:
+            # 2026-09-16 00:10 ⑤ 层生效度：stale 检测插件类方法是否真换血（avoid false green）
             grade_note = self._grade_reload_effect(success, live_note, core_stale, plugin_key=plugin_key)
         except Exception as _g_e:
             grade_note = f"\n⚠️ 生效度评分异常：{type(_g_e).__name__}: {_g_e}"
@@ -1425,7 +1426,9 @@ class PluginManager(Star):
         """
         try:
             import inspect as _insp
-            _star_mod = sys.modules.get("astrbot.core.star.star")
+            import sys as _sb
+            logger.info("[runtime_self_stale] 开始换血验证（%s）", plugin_key)
+            _star_mod = _sb.modules.get("astrbot.core.star.star")
             _sm = getattr(_star_mod, "star_map", None)
             if not _sm:
                 return {"ok": None}
@@ -1456,7 +1459,7 @@ class PluginManager(Star):
                 except Exception:
                     continue
                 for name, obj in list(vars(klass).items()):
-                    if scanned >= 10:
+                    if scanned >= 60:
                         break
                     if not _insp.isfunction(obj) or obj.__module__ != mod:
                         continue
@@ -1481,6 +1484,10 @@ class PluginManager(Star):
                 return {"ok": None}
             if stale:
                 return {"ok": False, "stale": stale[:5]}
+            logger.info(
+                "[runtime_self_stale] 换血验证通过：%d 方法/磁盘对齐（%s）",
+                scanned, plugin_key,
+            )
             return {"ok": True, "scanned": scanned}
         except Exception as _rt_e:
             return {"ok": None, "err": f"{type(_rt_e).__name__}: {_rt_e}"}
