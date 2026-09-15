@@ -729,7 +729,54 @@ class PluginManager(Star):
             logger.warning(
                 f"[插件管理] 重载前摘除旧绑定：tool×{n_tools} handler×{n_handlers} {samples}"
             )
-        return {"tools": n_tools, "handlers": n_handlers, "samples": samples}
+
+        # ── 第三张表：star_map + star_registry 里的 Plugin 类注册位（2026-09-15 假绿根因补）──
+        # 假绿根因自证：core star_manager.load() 的路径是
+        #   if path in star_map: metadata = star_map[path]   # ← 直接复用旧条目
+        #   metadata.star_cls = metadata.star_cls_type(...)   # ← 实例化的是「旧 Plugin 类」
+        # 也就是 load() 根本不看本次 __import__ 出来的新类，只看 star_map 里缓存的那一个。
+        # core _unbind_plugin 虽然有 `del star_map[plugin_module_path]`，但它只按
+        # smd.module_path 精确匹配才触发；路径一旦有大小写/前缀漂移就漏摘，
+        # 于是 17 次深度清缓存 + 绑定自检全绿，跑在内存里的还是旧 Mixin 的行号
+        # —— 表象就是「日志说完全生效、类方法一退没退」（2026-09-15 00:55 假绿实证）。
+        # 这里按「module_path 或 star_cls_type.__module__ 含内部名」放宽匹配，
+        # 把 star_map / star_registry 里这个插件的所有残留也一起摘干，
+        # 逼下次 load() 走 __init_subclass__ 重新注册的新类。
+        _sm, _sr = None, None
+        try:
+            from astrbot.core.star.star import star_map as _sm, star_registry as _sr
+        except Exception:
+            _sm, _sr = None, None
+        n_starmap = 0
+        star_probes: list = []
+        if _sm is not None and _sr is not None:
+            for meta in list(_sr):
+                mp = str(getattr(meta, "module_path", "") or "").lower()
+                cls = getattr(meta, "star_cls_type", None)
+                if key not in mp and not (
+                    cls is not None and key in str(getattr(cls, "__module__", "")).lower()
+                ):
+                    continue
+                try:
+                    mpth = str(getattr(meta, "module_path", "") or "")
+                    if mpth and mpth in _sm:
+                        del _sm[mpth]
+                    _sr.remove(meta)
+                    n_starmap += 1
+                    if len(star_probes) < 6:
+                        star_probes.append(mpth or "unknown")
+                except Exception:
+                    pass
+        if n_starmap:
+            logger.warning(
+                f"[插件管理] 重载前摘除 star_map/star_registry {n_starmap} 个：{star_probes[:5]}"
+            )
+        return {
+            "tools": n_tools,
+            "handlers": n_handlers,
+            "samples": samples,
+            "star_map_removed": n_starmap,
+        }
 
     def _audit_and_rebind(self, plugin_key: str) -> str:
         """核对插件 handler/tool 的绑定是否指向「当前在线的模块」，孤儿则强制重绑。
