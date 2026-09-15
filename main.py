@@ -871,7 +871,46 @@ class PluginManager(Star):
                     return None
             return obj
 
-        done_tools, done_handlers, failed = [], [], []
+        done_tools, done_handlers, done_self, failed = [], [], [], []
+
+        # ── 2026-09-15 23:00 新增：bound method 的 __self__ 一致性检查 ────
+        # 根因补充：_is_orphan 只查 __globals__（函数定义所在模块 dict），但
+        # llm_tool 注册的是 **bound method**（Plugin 实例的方法）。类重定义后
+        # __globals__ 跟着新模块 dict 一起翻新，_is_orphan 恰好看不出破绽，
+        # 可 __self__ 攥着的仍是旧 Plugin 实例 —— audit 全绿、跑起来的方法体
+        # 却是旧 MRO 上的旧 Mixin（2026-09-15 22:57 ·r6 探针不跑的实证）。
+        # 所以这里再补一刀：__self__.__class__ 必须就是 star_map[path] 里的
+        # star_cls_type；不然就把 bound method 从新实例上重新取一次。
+        def _resolve_fresh_self():
+            """取该插件当前 star_map 条目上的新 Plugin 实例"""
+            try:
+                _sm3 = _sys.modules.get("astrbot.core.star.star")
+                sm = getattr(_sm3, "star_map", None)
+                if sm is None:
+                    return None
+                for _p in sm:
+                    if key in str(_p).lower():
+                        return getattr(sm[_p], "star_cls", None)
+            except Exception:
+                pass
+            return None
+
+        def _rebind_self(t, attr_name, fn, log_line):
+            """bound method 指向旧实例时，从 star_cls 重新取同名方法"""
+            fresh = _resolve_fresh_self()
+            if fresh is None:
+                return None
+            fname = getattr(fn, "__name__", None)
+            if not fname:
+                return None
+            new_fn = getattr(fresh, fname, None)
+            if new_fn is None or getattr(new_fn, "__self__", None) is not fresh:
+                return None
+            try:
+                setattr(t, attr_name, new_fn)
+                return new_fn
+            except Exception:
+                return None
 
         # ① llm_tools 里的工具绑定
         if llm_tools is not None:
@@ -881,7 +920,24 @@ class PluginManager(Star):
                 if key not in mp.lower():
                     continue
                 attr_name, fn = _fn_of(t)
-                if fn is None or not _is_orphan(fn, mp):
+                if fn is None:
+                    continue
+                # ⚠️ 2026-09-15 23:05 破案新增：bound method 的 __self__ 检查
+                # 旧实例掉在 bound method 上而 __globals__ 已经同源翻新时，
+                # _is_orphan 判游哑火（这正是 22:57 ·r6 探针不跑的实证）——
+                # 所以先看 __self__.__class__ 还是不是当前 star_cls_type。
+                _inst = getattr(fn, "__self__", None)
+                _fresh = _resolve_fresh_self() if _inst is not None else None
+                _stale = (
+                    _inst is not None
+                    and _fresh is not None
+                    and getattr(_inst, "__class__", None) is not getattr(_fresh, "__class__", None)
+                )
+                if _stale:
+                    if _rebind_self(t, attr_name, fn, "self") is not None:
+                        done_self.append(getattr(t, "name", "?"))
+                    continue
+                if not _is_orphan(fn, mp):
                     continue
                 tname = getattr(t, "name", "?")
                 try:
@@ -905,7 +961,21 @@ class PluginManager(Star):
                 if key not in mp.lower():
                     continue
                 attr_name, fn = _fn_of(h)
-                if fn is None or not _is_orphan(fn, mp):
+                if fn is None:
+                    continue
+                # 同前：__self__ 旧实例时先尝试从新 star_cls 实例取同名方法重绑
+                _inst = getattr(fn, "__self__", None)
+                _fresh = _resolve_fresh_self() if _inst is not None else None
+                _stale = (
+                    _inst is not None
+                    and _fresh is not None
+                    and getattr(_inst, "__class__", None) is not getattr(_fresh, "__class__", None)
+                )
+                if _stale:
+                    if _rebind_self(h, attr_name, fn, "self") is not None:
+                        done_self.append(getattr(h, "handler_name", "?"))
+                    continue
+                if not _is_orphan(fn, mp):
                     continue
                 hname = getattr(h, "handler_name", "?")
                 try:
@@ -919,10 +989,13 @@ class PluginManager(Star):
                 except Exception:
                     failed.append(f"handler:{hname}")
 
-        if not (done_tools or done_handlers or failed):
+        if not (done_tools or done_handlers or done_self or failed):
             return "\n🔗 绑定自检：全部指向当前在线模块，无孤儿"
 
         parts = []
+        if done_self:
+            parts.append(f"__self__ 换血×{len(done_self)}（{', '.join(done_self[:5])}）")
+            logger.warning(f"[插件管理] __self__ 重绑到新 star_cls 实例：{done_self}")
         if done_tools:
             parts.append(f"tool×{len(done_tools)}（{', '.join(done_tools[:5])}）")
             logger.warning(f"[插件管理] 已重绑孤儿 tool：{done_tools}")
