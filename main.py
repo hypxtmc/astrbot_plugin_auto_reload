@@ -584,7 +584,7 @@ class PluginManager(Star):
         except Exception:
             core_stale = []
         try:
-            grade_note = self._grade_reload_effect(success, live_note, core_stale)
+            grade_note = self._grade_reload_effect(success, live_note, core_stale, plugin_key=plugin_key)
         except Exception as _g_e:
             grade_note = f"\n⚠️ 生效度评分异常：{type(_g_e).__name__}: {_g_e}"
         return receipt + rebind_note + handover_note + reclaim_note + live_note + grade_note
@@ -1405,7 +1405,87 @@ class PluginManager(Star):
         hits.sort(reverse=True)
         return [rel for _mt, rel in hits[:limit]]
 
-    def _grade_reload_effect(self, success, live_note, core_stale) -> str:
+    def _runtime_self_stale(self, plugin_key: str):
+        """热重载后「类方法血」运行时验证（2026-09-16 00:02 产品化）。
+
+        背景：2026-09-15 深夜实证三轮（·r6 绿 / ·r7、·r8 未绿），仅凭「模块缓
+        存清理 + 绑定自检 + 长活自检全绿」不足以判定插件类方法真的换了血，
+        Python 的 sys.modules + star_map 可能在某些 reload 分支留下旧类对象，
+        日志全绿、跑的还是旧代码（假绿）。本函数把这些实证抽成**通用判据**，
+        不依赖任何插件内置 ·rN 探针，对任意用户插件都适用。
+
+        判据（保守、零误报优先）：对 star_map 中该插件 star_cls_type 的 MRO
+        里每一个由插件源码定义的类（抽样前 10 个函数），比较
+        内存中 co_firstlineno 与磁盘文件里同名 def 的行号；
+        改动了其他位置导致方法行号位移时即可验出「内存仍是旧血」。
+        不覆盖"行号不变但方法体内容变了"的极端情形（保守漏检，不误报），
+        此类情况由四档生效度外的固定一行提醒兜底。
+
+        返回 {ok: True} / {ok: False, stale: [...]} / {ok: None}（无法判定，不误报）。
+        """
+        try:
+            import inspect as _insp
+            _star_mod = sys.modules.get("astrbot.core.star.star")
+            _sm = getattr(_star_mod, "star_map", None)
+            if not _sm:
+                return {"ok": None}
+            meta = None
+            kl = plugin_key.lower()
+            for path, m in _sm.items():
+                if kl in str(path).lower():
+                    meta = m
+                    break
+            if meta is None:
+                return {"ok": None}
+            cls = getattr(meta, "star_cls_type", None)
+            if cls is None:
+                return {"ok": None}
+            stale, scanned = [], 0
+            for klass in _insp.getmro(cls):
+                if klass in (object, type(None)):
+                    continue
+                mod = getattr(klass, "__module__", None)
+                if not mod or not mod.startswith("data.plugins"):
+                    continue
+                try:
+                    fpath = _insp.getsourcefile(klass)
+                    if not fpath:
+                        continue
+                    with open(fpath, encoding="utf-8") as _fh:
+                        disk_lines = _fh.readlines()
+                except Exception:
+                    continue
+                for name, obj in list(vars(klass).items()):
+                    if scanned >= 10:
+                        break
+                    if not _insp.isfunction(obj) or obj.__module__ != mod:
+                        continue
+                    scanned += 1
+                    try:
+                        mem_no = obj.__code__.co_firstlineno
+                    except Exception:
+                        continue
+                    disk_no = None
+                    pat = f"def {name}("
+                    for i, line in enumerate(disk_lines, start=1):
+                        if pat in line:
+                            disk_no = i
+                            break
+                    if disk_no is None or disk_no != mem_no:
+                        stale.append(
+                            f"{mod}: {name}（内存首行 {mem_no} / 磁盘 {disk_no}）"
+                        )
+                if len(stale) >= 2 or scanned >= 10:
+                    break
+            if scanned == 0:
+                return {"ok": None}
+            if stale:
+                return {"ok": False, "stale": stale[:5]}
+            return {"ok": True, "scanned": scanned}
+        except Exception as _rt_e:
+            return {"ok": None, "err": f"{type(_rt_e).__name__}: {_rt_e}"}
+
+    def _grade_reload_effect(self, success, live_note, core_stale, plugin_key=None) -> str:
         """把「这次重载到底生效到哪一层」写成一行结论（一期：生效度评分）。
 
         分层判据（与规划文档 L0-L4 对应）：
@@ -1424,6 +1504,26 @@ class PluginManager(Star):
         else:
             head = "🧭 生效度：✅ 完全生效（模块/绑定/长活对象均指向当前代码）"
         out = [head]
+        # ── 2026-09-16 第五层：运行时类方法换血验证（假绿防护） ──
+        # 兼容缺省 plugin_key：只有显式指定插件重载时才做，全量重载不做（怕拖慢回执）。
+        if plugin_key and success:
+            _rt = self._runtime_self_stale(plugin_key)
+            if _rt.get("ok") is False:
+                head = (
+                    "🧭 生效度：⚠️ 部分生效——模块/绑定已换血，但运行时类方法仍是旧版本"
+                    "（即「假绿」，运行时验证未通过）"
+                )
+                out = [head]
+                out.append("🚨 必须重启：本次热重载没能把这些类方法换血成功：")
+                for _s in _rt["stale"]:
+                    out.append(f"    · {_s}")
+                out.append(
+                    "🤖 请把这份结论原样通知用户/AI 操作者：插件已热重载但部分类方法"
+                )
+                out.append(
+                    "    使用旧代码，需要手动重启 AstrBot 后再重载一次，才能真正生效。"
+                )
+                return "\n" + "\n".join(out)
         if stale_lines:
             out.append(
                 "🚨 必须重启：astrbot/core 下有改动晚于本进程启动时刻，热重载带不进去——"
