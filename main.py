@@ -104,7 +104,7 @@ def _plugin_name_hint(query, registry, reason: str = "") -> str:
     "astrbot_plugin_auto_reload",
     "hypxtmc",
     "在聊天中管理 AstrBot 插件：查看列表、启停、重载（含平台换手/陈旧任务回收/生效度评分）、安装、卸载、更新",
-    "1.0.3-m3fix",
+    "1.0.5",
     "",
 )
 class PluginManager(Star):
@@ -1939,7 +1939,7 @@ class PluginManager(Star):
                             _diag.append(f"matched len={len(cur_prompt) if cur_prompt else 0}")
                             break
                 except Exception as _e:
-                    _diag.append(f"ERR {_type_err := type(_e).__name__}:{_e}")
+                    _diag.append(f"ERR {type(_e).__name__}:{_e}")
                 logger.info(f"[子代理热更新] 更新人格诊断 {persona_id}: {'; '.join(_diag)}; new_len={len(persona_prompt)}; will_update={cur_prompt is not None and cur_prompt != persona_prompt}")
                 if cur_prompt is not None and cur_prompt != persona_prompt:
                     await mgr.update_persona(persona_id, system_prompt=persona_prompt)
