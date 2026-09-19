@@ -1,3 +1,4 @@
+import functools
 import time
 
 from astrbot.api.event import filter, AstrMessageEvent
@@ -749,6 +750,54 @@ class PluginManager(Star):
                     reasons.append(
                         f"类血不同源：{getattr(cls, '__module__', '?')} 的类连着别的模块字典"
                     )
+                # 【2026-09-19 补盲区】类血同源扩到整个 MRO。
+                # 病形：@llm_tool 的壳在 main.py，方法体却在 dispatch/router 等 Mixin
+                # 子模块里。旧 Mixin 混进新类 MRO 时，上面单类检查照样全绿——
+                # dispatch.py 模块对象确实是新的（P1 过），但类上挂的基类还是旧对象，
+                # 于是壳函数 super().xxx() 顺着旧 MRO 走到旧方法体。
+                # 实测 2026-09-19 17:34：给 _emit_results 补形参后热重载回执「完全生效」，
+                # 调工具仍报 name 'enable_segmented_forward' is not defined。
+                stale_bases = []
+                for _base in getattr(cls, "__mro__", ()):
+                    _bmod = str(getattr(_base, "__module__", "") or "")
+                    if not _bmod.startswith("data.plugins."):
+                        continue
+                    _bm = _sys.modules.get(_bmod)
+                    if _bm is None:
+                        continue
+                    if getattr(_bm, _base.__name__, None) is not _base:
+                        stale_bases.append(_base.__name__)
+                if stale_bases:
+                    reasons.append(
+                        f"类血不同源（MRO 旧血）：{'、'.join(stale_bases[:3])} "
+                        f"不是在线模块里的同一个类对象"
+                    )
+
+        # P4 子模块换血校验（2026-09-18 补盲区）：
+        # 实测「主模块换新、dispatch/router 等 Mixin 子模块旧血」三判据全绿——
+        # P1 的 swapped>=1 即放行，旧 Mixin 混进新类 MRO 无人查。对 MRO 上每个
+        # 归属本插件的基类（快照里有其模块的），比对模块对象 id 是否换新，
+        # 未换新即判败 → 调用方升级全量。
+        if old_ids and cls is not None:
+            stale_mixins = []
+            for klass in getattr(cls, "__mro__", ()):
+                mname = str(getattr(klass, "__module__", "") or "")
+                if not mname:
+                    continue
+                oid = old_ids.get(mname)
+                if oid is None:
+                    continue
+                cur = _sys.modules.get(mname)
+                # 【2026-09-19 补洞】旧模块已被 purge 出 sys.modules 时 cur is None，
+                # 原判据 `cur is not None and id(cur) == oid` 直接 continue → 旧 Mixin
+                # 彻底隐身。而模块从 sys.modules 消失本身就是强 stale 信号：类上若还
+                # 挂着那个模块里的类对象，它一定没有在线的同源对应。
+                if cur is None or id(cur) == oid:
+                    stale_mixins.append(mname.rsplit(".", 1)[-1])
+            if stale_mixins:
+                reasons.append(
+                    f"P4 子模块未换血（Mixin 旧血混入 MRO）：{'、'.join(stale_mixins[:3])}"
+                )
 
         if len(metas) > 1:
             reasons.append(f"注册表里该插件有 {len(metas)} 条条目（重复注册）")
@@ -888,6 +937,22 @@ class PluginManager(Star):
             if hit:
                 names.append(mod_name)
                 snapshot[mod_name] = mod
+        # ── 2026-09-18 补漏（甲方案）：祖先包必须一并清理 ──
+        # namespace package（无 __init__.py）的 __file__ 为 None；短 key（如 "parallel_handoff"）
+        # 又不等于段名（"astrbot_plugin_parallel_handoff"）→ 父包漏网。父包属性上挂着的旧子模块
+        # 会让 main 里的 `from . import X` 直接取旧对象、不重建 sys.modules 条目，子模块改动
+        # 永不生效（也是 P4 探针拿不到输入的原因）。这里按前缀链补全插件树内的祖先包。
+        for _mn in list(names):
+            _parts = _mn.split(".")
+            for _i in range(3, len(_parts)):
+                _anc = ".".join(_parts[:_i])
+                if (
+                    _anc not in snapshot
+                    and _anc in _sys.modules
+                    and hasattr(_sys.modules[_anc], "__path__")
+                ):
+                    names.append(_anc)
+                    snapshot[_anc] = _sys.modules[_anc]
         # 先删深的子模块，再删包本体
         for m in sorted(names, key=lambda s: s.count("."), reverse=True):
             _sys.modules.pop(m, None)
@@ -949,8 +1014,13 @@ class PluginManager(Star):
             pass
 
         def _fn_of(obj):
+            # 2026-09-18 修：core 绑实例用的是 functools.partial(裸函数, 实例)，
+            # partial 没有 __globals__，不解包就取不到 __file__，_belongs 的
+            # 兜底判据跟着失效 → 漏摘残留 handler → 重载后照样崩。
             for attr in ("handler", "func", "callback", "func_obj"):
                 f = getattr(obj, attr, None)
+                if isinstance(f, functools.partial):
+                    f = f.func
                 if callable(f):
                     return f
             return None
@@ -987,22 +1057,19 @@ class PluginManager(Star):
                 hs = list(handlers_reg)
             except Exception:
                 hs = []
-            remover = getattr(handlers_reg, "remove_handler", None)
             for h in hs:
                 if not _belongs(h):
                     continue
-                try:
-                    if callable(remover):
-                        remover(h)
-                    else:
-                        inner = getattr(handlers_reg, "handlers", None)
-                        if isinstance(inner, list):
-                            inner.remove(h)
+                # 2026-09-18 修：原来走 getattr(reg, "remove_handler") /
+                # getattr(reg, "handlers")，两个名字在 AstrBot 4.27 都不存在
+                # （真名 _handlers + star_handlers_map），摘除静默空转而计数照样
+                # +1 → 日志谎报“handler×N 已摘除”，旧 handler 全留在表里，被
+                # core._bind_plugin 缝上新实例 → super(旧类,新实例) 崩。
+                # 现在只有真摘到才计数。
+                if self._drop_registry_handler(handlers_reg, h):
                     n_handlers += 1
                     if len(samples) < 6:
                         samples.append(f"handler:{getattr(h, 'handler_name', '?')}")
-                except Exception:
-                    pass
 
         if n_tools or n_handlers:
             logger.warning(
@@ -1019,6 +1086,86 @@ class PluginManager(Star):
             "handlers": n_handlers,
             "samples": samples,
         }
+
+    @staticmethod
+    def _drop_registry_handler(handlers_reg, h) -> bool:
+        """把 handler 从 star_handlers_registry 真摘掉（两个结构都要动）。
+
+        2026-09-18 修：原实现走 getattr(reg, "remove_handler") 与
+        getattr(reg, "handlers")，这两个名字在 AstrBot 4.27 里都不存在
+        （真名是 _handlers 列表 + star_handlers_map 字典），于是“摘除”全程
+        静默空转、计数却照样 +1 —— 日志报 handler×N 其实一个没摘。残留的
+        旧 handler 被 core._bind_plugin 按 module_path 匹配到，把新实例缝到
+        旧函数上（functools.partial），运行时 super(旧类, 新实例) TypeError。
+
+        Returns:
+            True 表示确实摘掉了至少一条。
+        """
+        ok = False
+        _lst = getattr(handlers_reg, "_handlers", None)
+        if isinstance(_lst, list):
+            try:
+                _before = len(_lst)
+                while h in _lst:
+                    _lst.remove(h)
+                if len(_lst) != _before:
+                    ok = True
+            except Exception:
+                pass
+        _map = getattr(handlers_reg, "star_handlers_map", None)
+        if isinstance(_map, dict):
+            try:
+                for _k, _v in list(_map.items()):
+                    if _v is h:
+                        _map.pop(_k, None)
+                        ok = True
+            except Exception:
+                pass
+        return ok
+
+    def _audit_mro_stale(self, plugin_key: str) -> list:
+        """扫该插件 MRO 上属于本插件的基类，找出「不在线」的旧类对象。
+
+        【2026-09-19 新增】补的是这么个盲区：@llm_tool 的壳函数挂在 main.py，
+        方法体却在 dispatch/router 等 Mixin 子模块里。壳函数的 __globals__
+        永远是新鲜的 main.py dict，于是 _is_orphan / _stale 三条绑定判据全绿；
+        P4 子模块换血校验又只在快路径跑。结果是旧 Mixin 顺着旧 MRO 继续执行，
+        回执却报「完全生效」—— 09-19 17:34 那次就是这么骗过去的：给 _emit_results
+        补了个形参，热重载回执全绿，调工具仍报 name '...' is not defined。
+
+        判据：对 MRO 上每个 __module__ 以 data.plugins. 开头的基类，断言
+        sys.modules[那个模块] 里的同名属性 is 这个基类。不等即旧血；
+        模块已不在 sys.modules 时也算旧血（类还挂着它就说明没跟着换）。
+
+        Returns:
+            旧血基类名列表，空列表表示干净。
+        """
+        import sys as _sys
+
+        key = str(plugin_key or "").strip().lower()
+        if not key:
+            return []
+        stale = []
+        try:
+            _sm = _sys.modules.get("astrbot.core.star.star")
+            smap = getattr(_sm, "star_map", None) or {}
+            for _p in smap:
+                if key not in str(_p).lower():
+                    continue
+                cls = getattr(smap[_p], "star_cls_type", None)
+                if cls is None:
+                    continue
+                for base in getattr(cls, "__mro__", ()):
+                    bmod = str(getattr(base, "__module__", "") or "")
+                    if not bmod.startswith("data.plugins."):
+                        continue
+                    bm = _sys.modules.get(bmod)
+                    if bm is None or getattr(bm, base.__name__, None) is not base:
+                        stale.append(f"{base.__name__}({bmod.rsplit('.', 1)[-1]})")
+                break
+        except Exception:
+            pass
+        return stale
 
     def _audit_and_rebind(self, plugin_key: str) -> str:
         """核对插件 handler/tool 的绑定是否指向「当前在线的模块」，孤儿则强制重绑。
@@ -1053,12 +1200,56 @@ class PluginManager(Star):
             pass
 
         def _fn_of(obj):
-            """鸭子类型取可调用实体，兼容不同版本的字段名"""
+            """鸭子类型取可调用实体，兼容不同版本的字段名。
+
+            2026-09-18 修：core 绑实例用的是 functools.partial(裸函数, 实例)，
+            不是 bound method。partial 既没有 __globals__ 也没有 __self__，
+            原实现把它当“函数”直接返回，于是两份自检双双哑火——_is_orphan
+            拿不到 __globals__ 就判“非孤儿”、__self__ 为 None 又跳过类一致性
+            检查，回执才会谎报“无孤儿”。这里解包到 .func。
+            """
             for attr in ("handler", "func", "callback", "func_obj"):
                 f = getattr(obj, attr, None)
+                if isinstance(f, functools.partial):
+                    f = f.func
                 if callable(f):
                     return attr, f
             return None, None
+
+        def _ours(obj):
+            """归属判定（与 _evict_plugin_bindings 里的 _belongs 同构）。
+
+            2026-09-18 新增：原过滤只看 handler_module_path，该字段为空或
+            形态异常（core 重建过、显式 append 注册）时整个 handler 被跳过，
+            而 evict 那边正好也漏——两处盲区叠加，残留的旧函数就被 core 缝上
+            新实例，super(旧类,新实例) 必炸。补上 __file__ 兜底判据。
+            """
+            _mp = str(getattr(obj, "handler_module_path", "") or "")
+            if key in _mp.lower():
+                return True
+            _a, _f = _fn_of(obj)
+            _g = getattr(_f, "__globals__", None) if _f is not None else None
+            if isinstance(_g, dict) and key in str(_g.get("__file__", "")).lower():
+                return True
+            return False
+
+        def _bound_self(obj):
+            """取条目上钉着的实例：bound method 看 __self__，partial 看 args[0]。
+
+            2026-09-18 新增：core（star_manager._bind_plugin）用
+            functools.partial(裸函数, star_cls) 绑实例，partial 没有 __self__，
+            旧的 __self__ 一致性检查对这类共 0 命中——正是它放过了残留的旧
+            handler，最终让管线里“旧函数 + 新实例”以 super(旧类,新实例) 崩。
+            """
+            raw = None
+            for attr in ("handler", "func", "callback", "func_obj"):
+                raw = getattr(obj, attr, None)
+                if raw is not None:
+                    break
+            if isinstance(raw, functools.partial):
+                args = getattr(raw, "args", None) or ()
+                return args[0] if args else None
+            return getattr(raw, "__self__", None)
 
         def _is_orphan(fn, mod_name):
             """函数所属模块是否已下线。
@@ -1184,16 +1375,20 @@ class PluginManager(Star):
                 _hs = list(handlers_reg)
             except Exception:
                 _hs = []
-            remover = getattr(handlers_reg, "remove_handler", None)
             for h in _hs:
                 mp = str(getattr(h, "handler_module_path", "") or "")
-                if key not in mp.lower():
+                # 2026-09-18 修：原来是单判据 key in mp，字段空/异常就整条跳过；
+                # 与 evict 的 _belongs 统一为「module_path 或 __file__」双判据。
+                if key not in mp.lower() and not _ours(h):
                     continue
                 attr_name, fn = _fn_of(h)
                 if fn is None:
                     continue
-                # 同前：__self__ 旧实例时先尝试从新 star_cls 实例取同名方法重绑
-                _inst = getattr(fn, "__self__", None)
+                hname = getattr(h, "handler_name", "?")
+                # 2026-09-18 修：绑定实例一律用 _bound_self 取（兼容 partial）；
+                # 且 __self__ 旧实例时不再“重绑”而是**摘除**——重载后新绑定已由
+                # load 重新注册，留着旧条目只会在管线里以 super(旧类,新实例) 崩。
+                _inst = _bound_self(h)
                 _fresh = _resolve_fresh_self() if _inst is not None else None
                 _stale = (
                     _inst is not None
@@ -1201,23 +1396,31 @@ class PluginManager(Star):
                     and getattr(_inst, "__class__", None) is not getattr(_fresh, "__class__", None)
                 )
                 if _stale:
-                    if _rebind_self(h, attr_name, fn, "self") is not None:
-                        done_self.append(getattr(h, "handler_name", "?"))
+                    if self._drop_registry_handler(handlers_reg, h):
+                        done_handlers.append(f"{hname}(旧实例)")
+                    else:
+                        failed.append(f"handler:{hname}")
                     continue
                 if not _is_orphan(fn, mp):
                     continue
-                hname = getattr(h, "handler_name", "?")
-                try:
-                    if callable(remover):
-                        remover(h)
-                    else:
-                        _hs_list = getattr(handlers_reg, "handlers", None)
-                        if isinstance(_hs_list, list):
-                            _hs_list.remove(h)
+                if self._drop_registry_handler(handlers_reg, h):
                     done_handlers.append(hname)
-                except Exception:
+                else:
                     failed.append(f"handler:{hname}")
 
+        # ── 2026-09-19 新增：MRO 旧血自检 ──
+        # 上面三条判据都只认「壳函数所在模块」，而 @llm_tool 的壳在 main.py、
+        # 方法体在 dispatch/router 等 Mixin 里 —— 壳永远是新鲜的，判据必然全绿。
+        # 这段独立扫 MRO，把「旧 Mixin 类对象还挂在类上」单独揪出来。
+        _mro_stale = self._audit_mro_stale(key)
+        if _mro_stale:
+            return (
+                f"\n🧬 MRO 旧血自检：⚠️ 假绿——{', '.join(_mro_stale[:3])} "
+                f"仍挂在类的 MRO 上，方法体走的还是旧代码"
+                f"\n   成因：工具的壳函数在 main.py，绑定自检只看得到壳；"
+                f"真正执行的方法体在这些 Mixin 子模块里"
+                f"\n🚨 必须重启：Mixin 的类对象热重载换不掉，重启后才能真正生效"
+            )
         if not (done_tools or done_handlers or done_self or failed):
             return "\n🔗 绑定自检：全部指向当前在线模块，无孤儿"
 
@@ -1658,6 +1861,12 @@ class PluginManager(Star):
             cls = getattr(meta, "star_cls_type", None)
             if cls is None:
                 return {"ok": None}
+            # 2026-09-18 修复：原实现对「MRO 上一个 tag 都没检查到」也无条件
+            # return ok=True，把「无法判定」错报成「验证通过」，
+            # 导致 _runtime_self_stale 的回退链从未被走到（日志零条实锤）。
+            # 现按 docstring 语义：检查到 ≥1 个 tag 才有资格判 ok=True，
+            # 全跳过 → ok=None 交回退判据（行号比对）。
+            _tag_checked = 0
             for klass in _insp.getmro(cls):
                 kmod = getattr(klass, "__module__", None)
                 if not kmod or not kmod.startswith("data.plugins"):
@@ -1665,6 +1874,7 @@ class PluginManager(Star):
                 mem_tag = getattr(klass, "RUNTIME_BUILD_TAG", None)
                 if mem_tag is None:
                     continue
+                _tag_checked += 1
                 fpath = _insp.getsourcefile(klass)
                 if not fpath:
                     continue
@@ -1685,6 +1895,8 @@ class PluginManager(Star):
                             f"{kmod}: RUNTIME_BUILD_TAG 内存={mem_tag} / 磁盘={m2.group(1)}"
                         ],
                     }
+            if _tag_checked == 0:
+                return {"ok": None}
             return {"ok": True}
         except Exception as _e:
             return {"ok": None, "err": f"{type(_e).__name__}: {_e}"}
@@ -1727,6 +1939,7 @@ class PluginManager(Star):
             if cls is None:
                 return {"ok": None}
             stale, scanned = [], 0
+            _ast_cache = {}
             for klass in _insp.getmro(cls):
                 if klass in (object, type(None)):
                     continue
@@ -1739,6 +1952,28 @@ class PluginManager(Star):
                         continue
                     with open(fpath, encoding="utf-8") as _fh:
                         disk_lines = _fh.readlines()
+                    if fpath not in _ast_cache:
+                        # ── 2026-09-18 修误报：AST 精确定位索引 ──
+                        # 键 (类名 → 方法名) → co_firstlineno 应值 = min(第一个装饰器行…, def 行)，
+                        # 与 CPython 编译时写入 __code__.co_firstlineno 的语义一致。
+                        _idx = {}
+                        try:
+                            import ast as _ast
+                            for _c in _ast.walk(_ast.parse("".join(disk_lines))):
+                                if not isinstance(_c, _ast.ClassDef):
+                                    continue
+                                for _f in _c.body:
+                                    if isinstance(
+                                        _f, (_ast.FunctionDef, _ast.AsyncFunctionDef)
+                                    ):
+                                        _idx.setdefault(_c.name, {})[_f.name] = min(
+                                            [_f.lineno]
+                                            + [d.lineno for d in _f.decorator_list]
+                                        )
+                        except Exception:
+                            _idx = {}
+                        _ast_cache[fpath] = _idx
+                    _disk_index = _ast_cache[fpath]
                 except Exception:
                     continue
                 for name, obj in list(vars(klass).items()):
@@ -1751,18 +1986,25 @@ class PluginManager(Star):
                         mem_no = obj.__code__.co_firstlineno
                     except Exception:
                         continue
-                    disk_no = None
-                    pat = f"def {name}("
-                    for i, line in enumerate(disk_lines, start=1):
-                        if pat in line:
-                            disk_no = i
-                            break
-                    if disk_no is None or disk_no != mem_no:
+                    # 2026-09-18 修误报①：原实现用 `def {name}(` 朴素搜行，跨类同名方法
+                    # （__init__/terminate）必抓到文件里第一个 → 误报 stale；
+                    # 修误报②：原实现拿 def 行比 co_firstlineno，而后者对带装饰器的方法
+                    # 指向第一个装饰器行，凡有装饰器必差出装饰器行数。两条合起来就是
+                    # 「任何重载都被判必须重启」。改为查 AST 索引；定位不到即判「无法判定」
+                    # 跳过（零误报优先），不再当成旧血。
+                    disk_no = _disk_index.get(klass.__name__, {}).get(name)
+                    if disk_no is None:
+                        continue
+                    if disk_no != mem_no:
                         stale.append(
                             f"{mod}: {name}（内存首行 {mem_no} / 磁盘 {disk_no}）"
                         )
-                if len(stale) >= 2 or scanned >= 10:
+                if len(stale) >= 2 or scanned >= 200:
                     break
+                # 2026-09-18：外层上限 10 → 200。原值下 MRO 前几个 Mixin
+                # （config/scene/memory）就把 10 个名额吃光，永远扫不到
+                # dispatch/router 这些深处子模块——假绿恰好都藏在那里。
+                # stale>=2 短路保留：抓到两处旧血即定罪，不必扫完。
             if scanned == 0:
                 return {"ok": None}
             if stale:
@@ -1800,6 +2042,21 @@ class PluginManager(Star):
             _rt = self._tag_freshness(plugin_key)
             if _rt.get("ok") is None:
                 _rt = self._runtime_self_stale(plugin_key)
+            # 【2026-09-19 补盲区】上面两条探针双盲：_tag_freshness 认类属性
+            # （插件给的是模块级常量 → 取到 0 个 → 返回 ok=None 直接跳过），
+            # _runtime_self_stale 只比方法首行号（给签名加参数不位移任何行号
+            # → 零 stale → 判「完全生效」）。而真凶是 MRO 上挂着旧 Mixin 类对象。
+            if _rt.get("ok") is not False:
+                _mro_stale = self._audit_mro_stale(plugin_key)
+                if _mro_stale:
+                    _rt = {
+                        "ok": False,
+                        "stale": [
+                            f"{_n}：Mixin 类对象仍是旧版本（方法体在子模块里，"
+                            f"壳函数在 main.py 所以绑定自检查不到）"
+                            for _n in _mro_stale
+                        ],
+                    }
             if _rt.get("ok") is False:
                 head = (
                     "🧭 生效度：⚠️ 部分生效——模块/绑定已换血，但运行时类方法仍是旧版本"
