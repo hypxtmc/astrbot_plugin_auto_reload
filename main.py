@@ -105,7 +105,7 @@ def _plugin_name_hint(query, registry, reason: str = "") -> str:
     "astrbot_plugin_auto_reload",
     "hypxtmc",
     "在聊天中管理 AstrBot 插件：查看列表、启停、重载（含平台换手/陈旧任务回收/生效度评分）、安装、卸载、更新",
-    "1.0.5",
+    "1.1.0",
     "",
 )
 class PluginManager(Star):
