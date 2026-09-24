@@ -205,7 +205,11 @@ class PluginManager(Star):
 
     @staticmethod
     def _rewrap_handler(orig, new):
-        """按 orig 的包装结构把 new 包回去，保持原有调用约定。"""
+        """按 orig 的包装结构把 new 包回去，保持原有调用约定。
+
+        partial 会自动展平，`partial(partial(f, 1), c=3)` 在构造时就变成
+        `partial(f, 1, c=3)`，嵌套结构不会留在对象里，所以这里一层就够。
+        """
         if isinstance(orig, functools.partial):
             return functools.partial(new, *orig.args, **(orig.keywords or {}))
         return new
