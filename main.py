@@ -105,7 +105,7 @@ def _plugin_name_hint(query, registry, reason: str = "") -> str:
     "astrbot_plugin_auto_reload",
     "hypxtmc",
     "在聊天中管理 AstrBot 插件：查看列表、启停、重载（含平台换手/陈旧任务回收/生效度评分）、安装、卸载、更新",
-    "1.2.0",
+    "1.3.0",
     "",
 )
 class PluginManager(Star):
@@ -114,6 +114,101 @@ class PluginManager(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
+        # 重载成功后登记待复核项：{plugin_key: True}。
+        # on_llm_request 钩子只在非空时工作，空表时零开销。
+        self._pending_swap: dict = {}
+        # 钩子是否已自证上线：注册本身不打日志，靠首次被调用来证明。
+        self._handler_hooked = False
+
+    # ─────────────────────────────
+    # on_llm_request 就地换血（2026-09-25）
+    # ─────────────────────────────
+
+    @filter.on_llm_request()
+    async def _sync_stale_handlers(self, event: AstrMessageEvent, req) -> None:
+        """请求 LLM 前，把工具表里残留的旧 handler 就地换成内存里的最新版。
+
+        【为何加这一层】工具 handler 在对话轮开头被收集成快照，此后无论重载
+        多少次，同一轮里拿到的都是那批旧函数对象——这是「假绿」的通道，也是
+        「验一次要等对方再开口」的根。
+
+        而 on_llm_request 是插件还能动手的最后一站：core 在 build_main_agent
+        阶段填好 req.func_tool，随后触发本钩子，最后才交给 provider。在这一步
+        换掉，本次调用就用新代码——不必等下一轮，也不必谁再开口。
+
+        判据照旧不吃快照：从 core 的 handler 注册表按模块路径取最新 handler，
+        与工具表里那个比底层函数对象身份，不同即换。注册表在重载当场更新，
+        所以它永远反映磁盘最新代码。
+
+        空表时零开销：只有重载成功后才会登记待复核项。
+        """
+        # 钩子注册（get_handler_or_create）不打日志，靠首次被调用来证明它确实挂上了。
+        if not self._handler_hooked:
+            self._handler_hooked = True
+            logger.info(
+                "[插件管理] on_llm_request 钩子已上线："
+                "重载后不必等待，本轮即可换血"
+            )
+        if not self._pending_swap:
+            return
+        try:
+            tools = list(
+                getattr(getattr(req, "func_tool", None), "tools", None) or []
+            )
+            if not tools:
+                return
+            from astrbot.core.star.star_handler import star_handlers_registry as _reg
+
+            swapped, checked = 0, 0
+            for _t in tools:
+                _mp = str(getattr(_t, "handler_module_path", "") or "")
+                if not _mp:
+                    continue
+                _low = _mp.lower()
+                if not any(
+                    _low.endswith(_k) or _k in _low for _k in self._pending_swap
+                ):
+                    continue
+                checked += 1
+                for _md in _reg.get_handlers_by_module_name(_mp) or []:
+                    if getattr(_md, "handler_name", None) != getattr(_t, "name", None):
+                        continue
+                    _new = getattr(_md, "handler", None)
+                    if _new is None:
+                        break
+                    if self._unwrap_handler(_t.handler) is self._unwrap_handler(_new):
+                        break
+                    _t.handler = self._rewrap_handler(_t.handler, _new)
+                    swapped += 1
+                    break
+            if swapped:
+                logger.info(
+                    f"[插件管理] on_llm_request 就地换血成功：{swapped}/{checked} 个"
+                    f"工具 handler 已指向内存最新版，本轮即可用，无需等待"
+                )
+                self._pending_swap.clear()
+            elif checked:
+                logger.info(
+                    f"[插件管理] on_llm_request 复核 {checked} 个工具："
+                    f"handler 已是最新，无需替换"
+                )
+                self._pending_swap.clear()
+        except Exception:
+            logger.exception("[插件管理] on_llm_request 就地换血失败")
+
+    @staticmethod
+    def _unwrap_handler(h):
+        """剥掉 functools.partial 包装，取出底层函数对象用于身份比对。"""
+        while isinstance(h, functools.partial):
+            h = h.func
+        return h
+
+    @staticmethod
+    def _rewrap_handler(orig, new):
+        """按 orig 的包装结构把 new 包回去，保持原有调用约定。"""
+        if isinstance(orig, functools.partial):
+            return functools.partial(new, *orig.args, **(orig.keywords or {}))
+        return new
 
     # ─────────────────────────────────────────
     # 工具方法
@@ -585,6 +680,13 @@ class PluginManager(Star):
             core_stale = self._scan_unapplied_core_changes()
         except Exception:
             core_stale = []
+        # 重载成功 → 登记待复核，下一个 on_llm_request 到来时把工具表里残留的
+        # 旧 handler 就地换掉（不必等对方再开口）。
+        if success and plugin_key:
+            try:
+                self._pending_swap[str(plugin_key).strip().lower()] = True
+            except Exception:
+                pass
         try:
             # 2026-09-16 00:10 ⑤ 层生效度：stale 检测插件类方法是否真换血（avoid false green）
             grade_note = self._grade_reload_effect(
