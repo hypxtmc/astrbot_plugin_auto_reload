@@ -694,10 +694,36 @@ class PluginManager(Star):
             )
         except Exception as _g_e:
             grade_note = f"\n⚠️ 生效度评分异常：{type(_g_e).__name__}: {_g_e}"
+        # 钩子自检：注册这条路径不打日志，不自己查一遍就是又一个盲区。
+        hook_note = self._audit_hook_registered()
         return (
             receipt + rebind_note + handover_note
-            + reclaim_note + live_note + grade_note
+            + reclaim_note + live_note + grade_note + hook_note
         )
+
+    def _audit_hook_registered(self) -> str:
+        """核对本插件的 on_llm_request 钩子有没有真正进注册表。
+
+        【为何要这一道】钩子注册走 get_handler_or_create，那函数不打日志，
+        所以「注册成功」在日志里没有任何痕迹。而这一层钩子恰恰承担着
+        「重载后无需等待」的责任，它掉线了外面看不出来——又是一次沉默的假绿。
+        这里直接查注册表要坐标：模块名对得上、方法名对得上，就算挂上了。
+        """
+        try:
+            from astrbot.core.star.star_handler import star_handlers_registry as _reg
+
+            names = {
+                str(getattr(_md, "handler_name", "") or "")
+                for _md in (_reg.get_handlers_by_module_name(__name__) or [])
+            }
+            if "_sync_stale_handlers" in names:
+                return "\n🪝 钩子自检：on_llm_request 已注册，重载后本轮即可换血"
+            return (
+                "\n🪝 钩子自检：⚠️ on_llm_request 未在注册表中"
+                f"（本模块现有 handler：{sorted(names) or '无'}）"
+            )
+        except Exception as _e:
+            return f"\n🪝 钩子自检：⚠️ 查询失败 {type(_e).__name__}: {_e}"
 
     def _purge_plugin_modules(self, plugin_key: str):
         """把插件自身及其子模块从 sys.modules 里挖掉，强制下次 import 重读盘。
