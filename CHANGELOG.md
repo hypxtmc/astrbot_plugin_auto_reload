@@ -1,5 +1,13 @@
 # 更新记录
 
+## 1.2.0（2026-09-25）
+
+重载路径收敛。移除定向快路径，改用 core 的 `reload(name)` 指定分支：终止 → 解绑 → 重载三件事全走，带 terminate，0.28s 换净 17 个模块。先前「指定分支漏 star_cls 换血」的结论判断有误——根因是同一对话轮内工具 handler 是快照，回执由旧壳打印，跟走哪条路径无关。
+
+换血判据重写。原判据里两条依赖被重载的代码自报家门：`_tag_freshness` 认子模块里手写的 `RUNTIME_BUILD_TAG`，漏更新就误报未生效；`_runtime_self_stale` 只比方法首行号，给签名加参数不位移任何行号，零 stale 直接漏判。两条调用点已摘，源码保留备查。新增 `_audit_swap_identity`：模块、插件类、插件实例三层 `id()` 前后比对，由解释器当场给出，零维护，读写都落在当前进程内存上，不受 handler 快照影响。同时立一条规矩——判不了必须开口，采不到目标时回执写明原因，不再静默跳过。
+
+删 `_quick_target_reload`、`_verify_quick_swap`、`_match_plugin_metas`、`_resolve_target_dir` 四个方法与 `quick` 参数；新增 `_collect_identity`、`_audit_swap_identity`，`_snapshot_star` 补 identity 层。`main.py` 2295 → 2425 行。
+
 ## 1.1.0（2026-09-19）
 
 MRO 旧血自检。修的是一个骗了我们一整天的假绿。

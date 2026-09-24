@@ -105,7 +105,7 @@ def _plugin_name_hint(query, registry, reason: str = "") -> str:
     "astrbot_plugin_auto_reload",
     "hypxtmc",
     "在聊天中管理 AstrBot 插件：查看列表、启停、重载（含平台换手/陈旧任务回收/生效度评分）、安装、卸载、更新",
-    "1.1.0",
+    "1.2.0",
     "",
 )
 class PluginManager(Star):
@@ -458,7 +458,6 @@ class PluginManager(Star):
         name: str,
         handover_platforms: bool = False,
         reclaim_tasks: bool = False,
-        quick: bool = True,
     ) -> str:
         """热重载任意 AstrBot 插件（重载后插件代码立即生效，返回值自带验证回执）。
 
@@ -466,7 +465,6 @@ class PluginManager(Star):
             name (string): 插件名（可传 all 表示全部）。支持内部名/展示名/目录名/序号（从 plugin_list 输出取序）。传错时回执会直接给出内部名候选。
             handover_platforms (boolean): 二期能力，默认 False。开启后在该插件重载完成后，停掉它持有的旧平台适配器实例、按新代码重挂（治「平台适配器型」插件重载后仍走旧代码）。代价是通道断线重连约 1-3 秒，期间消息可能丢，仅在确实需要换血时开启。
             reclaim_tasks (boolean): 三期能力，默认 False。开启后取消该插件自己 create_task 起、且仍跑旧代码的后台任务（定时器/巡检/重试循环这类，不经平台注册、二期收不走）。只杀「持旧模块代码」的任务，新任务不受影响。适合插件自起后台循环的场合；不确定时可先只开 handover_platforms，看回执里 🧬 那行再定。
-            quick (boolean): 定向快路径，默认 True（只对指定单个插件生效，传 all 时忽略）。开启后不再全量重载：只摘该插件的绑定/注册表 + 深度清它的模块缓存，然后只重导它一个（其余插件不终止、不重新 import，约 1-3 秒）。重导完立刻跑三判据探针（模块换新 / 类血同源 / 注册表唯一），探针不过就自动升级全量重载兜底，回执里会写明走了哪条路。传 False 强制直接全量。
         """
         try:
             allowed = event.is_admin() if hasattr(event, "is_admin") else False
@@ -483,8 +481,6 @@ class PluginManager(Star):
             except Exception as e:
                 return f"❌ 未找到插件「{name}」\n{e}"
 
-        # 方案 B 总闸（2026-09-16 晚）：面板可一键禁用快路径，回到纯全量。
-        quick = bool(quick) and bool(self.config.get("hot_reload_quick_default", True))
         before = self._snapshot_star(plugin_key) if plugin_key else {}
         # 深度清理模块缓存：AstrBot 的 reload 走 __import__，
         # sys.modules 里已缓存的子模块不会被清（核心的模块名前缀匹配与运行时
@@ -504,29 +500,15 @@ class PluginManager(Star):
         capture = _ReloadLogCapture()
         capture.start()
         t0 = time.monotonic()
-        path_note = ""
         try:
-            # 2026-09-15 23:27 锁全量逻辑同上：核心是「指定某插件分支」能走到的是
-            # 损假绿路径—— — core 只 _unbind+load 指定 path，star_map 若已 fresh 会导致直接复用旧 star_cls_type；
-            # 传 None 强制 reload 全插件走 load(None)，那边 star_map.clear()
-            # + star_registry.clear() + __init_subclass 重新注册 → 全换血 → 真绿。
-            # 2026-09-16 晚 方案 B：默认先走「定向快路径」——只重导目标插件，
-            # 重导完由三判据探针判定是否真换血；不过就升级下面的全量兜底。
-            quick_ok = False
-            if plugin_key and quick:
-                quick_ok, path_note = await self._quick_target_reload(
-                    plugin_key, module_snapshot
-                )
-            if plugin_key and quick and quick_ok:
-                success, error_message = True, None
-            else:
-                if plugin_key and quick:
-                    path_note += (
-                        "\n⤴️ 快路径未过 → 已自动升级全量重载（本次仍保证真换血）"
-                    )
-                success, error_message = await self._get_pm().reload(None)
-                if not success:
-                    self._restore_plugin_modules(module_snapshot)
+            # 2026-09-25 03:40 改回 core 的指定分支：reload(name) 是
+            # 终止 → 解绑 → 重载三件事全走，比自造快路径还全（快路径恰恰欠了
+            # terminate 那一腿）。9-15 那句「指定分支漏 star_cls 换血」很可能是
+            # loop 快照造成的误判——今晚同一个坑我刚踩过一遍。跨消息验证后再定论。
+            # 传 all / 解析不出目标时 plugin_key 为空，退回全量 load(None)。
+            success, error_message = await self._get_pm().reload(plugin_key or None)
+            if not success:
+                self._restore_plugin_modules(module_snapshot)
         except Exception as e:
             success, error_message = False, f"{type(e).__name__}: {e}"
             self._restore_plugin_modules(module_snapshot)
@@ -605,312 +587,14 @@ class PluginManager(Star):
             core_stale = []
         try:
             # 2026-09-16 00:10 ⑤ 层生效度：stale 检测插件类方法是否真换血（avoid false green）
-            grade_note = self._grade_reload_effect(success, live_note, core_stale, plugin_key=plugin_key)
+            grade_note = self._grade_reload_effect(
+                success, live_note, core_stale, plugin_key=plugin_key, before=before
+            )
         except Exception as _g_e:
             grade_note = f"\n⚠️ 生效度评分异常：{type(_g_e).__name__}: {_g_e}"
         return (
-            receipt + path_note + rebind_note + handover_note
+            receipt + rebind_note + handover_note
             + reclaim_note + live_note + grade_note
-        )
-
-    # ─────────────────────────────────────────
-    # 定向快路径（2026-09-16 晚 · 方案 B）
-    # ─────────────────────────────────────────
-
-    def _match_plugin_metas(self, plugin_key: str):
-        """找出 star_map 里属于该插件的条目，返回 [(module_path, meta), ...]。
-
-        匹配口径与 _purge_plugin_modules 对齐：先按「模块名分段相等」精确命中，
-        全空时才退到子串兜底。子串优先会误伤同名插件，而误伤的后果是 P3
-        「注册表唯一」判据误报，把快路径无畐钉死。
-        """
-        out = []
-        try:
-            from astrbot.core.star.star import star_map as _sm
-        except Exception:
-            return out
-        key = str(plugin_key or "").strip().lower()
-        if not key:
-            return out
-
-        def _seg_hit(s) -> bool:
-            # star_map 的 key 是「main@data.plugins.xxx.main」形态：@ 把首段粘成
-            # 「main@data」，任何内部名永远命中不了首段——必须额外给 key 造一个
-            # 「模块名@前缀」形态去撞（2026-09-16 快路径两次报「无条目」的真因）
-            star_mod = ""
-            if "@" in str(s):
-                star_mod = str(s).split("@", 1)[1]
-            return any(
-                seg.lower() == key
-                for seg in str(s).split(".") + (star_mod.split(".") if star_mod else [])
-            )
-
-        for path, meta in list(_sm.items()):
-            cls = getattr(meta, "star_cls_type", None)
-            cm = str(getattr(cls, "__module__", "") or "")
-            if _seg_hit(path) or _seg_hit(cm):
-                out.append((path, meta))
-        if not out:
-            for path, meta in list(_sm.items()):
-                cls = getattr(meta, "star_cls_type", None)
-                cm = str(getattr(cls, "__module__", "") or "")
-                if key in str(path).lower() or key in cm.lower():
-                    out.append((path, meta))
-        return out
-
-    def _resolve_target_dir(self, plugin_key: str) -> str:
-        """定向 load 要的是插件目录名（specified_dir_name），不是内部名。
-
-        meta.root_dir_name 由 core load() 写入（= data/plugins 下的目录名）；
-        metadata.yaml 的 name 与目录名不一致时，用内部名去 load 会一个都匹配不上。
-        """
-        for _path, meta in self._match_plugin_metas(plugin_key):
-            d = str(getattr(meta, "root_dir_name", "") or "")
-            if d:
-                return d
-        try:
-            for m in self.context.get_all_stars():
-                if getattr(m, "name", "") == plugin_key:
-                    d = str(getattr(m, "root_dir_name", "") or "")
-                    if d:
-                        return d
-        except Exception:
-            pass
-        return str(plugin_key or "")
-
-    def _verify_quick_swap(self, plugin_key: str, module_snapshot: dict):
-        """快路径三判据探针（零误报优先，任一不过即判「未真换血」→ 升级全量）。
-
-        P1 模块换新：主模块必须回到 sys.modules 且是**新对象**。purge 前旧对象
-                     的 id 存在 module_snapshot 里，id 相同即旧模块复活（Python
-                     id 复用概率可忽略）。再补一刀：若被清模块无一换新，全判假绿。
-        P2 类血同源：在线 star_cls_type 的 __globals__ 必须就是当前 sys.modules
-                     里同名模块的 __dict__。旧类连着旧模块字典，一测就露——
-                     这正是 2026-09-15「star_map 复用旧 star_cls_type」的病根。
-        P3 注册表唯一：star_registry 里该插件只剩一条、实例类型与注册类一致。
-        """
-        import sys as _sys
-
-        reasons = []
-        metas = self._match_plugin_metas(plugin_key)
-        if not metas:
-            return {"ok": False, "reasons": ["注册表里找不到该插件条目（摘表后未重新注册）"]}
-
-        path, meta = metas[0]
-        old_ids = {n: id(m) for n, m in (module_snapshot or {}).items()}
-        main_mod = str(getattr(meta, "module_path", "") or path)
-        live = _sys.modules.get(main_mod)
-        if live is None:
-            reasons.append(f"主模块未回到 sys.modules：{main_mod.split('.')[-1]}")
-        elif old_ids.get(main_mod) == id(live):
-            reasons.append(f"主模块对象未换新（id 未变）：{main_mod.split('.')[-1]}")
-        swapped = 0
-        for n, oid in old_ids.items():
-            cur = _sys.modules.get(n)
-            if cur is not None and id(cur) != oid:
-                swapped += 1
-        if old_ids and swapped == 0:
-            reasons.append(f"被清理的 {len(old_ids)} 个模块无一换新对象")
-
-        cls = getattr(meta, "star_cls_type", None)
-        if cls is None:
-            reasons.append("star_cls_type 为空")
-        else:
-            mod = _sys.modules.get(str(getattr(cls, "__module__", "") or ""))
-            if mod is None:
-                reasons.append(f"类所属模块不在线：{getattr(cls, '__module__', '?')}")
-            else:
-                # 【2026-09-17 真凶】原判据 getattr(cls, "__globals__", None) 是恒 None：
-                # __globals__ 是**函数**的属性，类根本没有它（CPython 实测
-                # hasattr(SomeClass, "__globals__") is False，A.__init__ 若是继承来的
-                # object.__init__ 更是 wrapper_descriptor）。取到 None 后
-                # `None is not mod.__dict__` 恒真 → P2 对任何插件、任何时刻都判不过，
-                # 快路径被这把假秤永久钉死：每次都白跑 ~0.16s 再升级 18s 全量
-                # （01:13/01:15/01:16/01:21 四枪全挂同一句话，而 P1 每次都过 ——
-                # 换血其实一直是好的，只死在探针自己身上）。
-                # 正确取法两条，都要过：
-                #   ① 在线模块里按名字找到的必须是同一个类对象（最正规、恒可用）；
-                #   ② 类体里函数的 __globals__ 必须就是该模块的 __dict__（取得到时再查）；
-                # 类体里一个函数都没有时 ② 自然跳过，不误伤。
-                mod_cls = getattr(mod, str(getattr(cls, "__name__", "") or ""), None)
-                cls_globals = None
-                for _v in list(vars(cls).values()):
-                    _fn = getattr(_v, "__func__", _v)  # classmethod/staticmethod/bound 拆包
-                    _g = getattr(_fn, "__globals__", None)
-                    if _g is not None:
-                        cls_globals = _g
-                        break
-                _cname = getattr(cls, "__name__", "?")
-                if mod_cls is not cls:
-                    reasons.append(
-                        f"类血不同源：{getattr(cls, '__module__', '?')} 在线模块里的 "
-                        f"{_cname} 不是同一个类对象（旧类仍被注册表攥着）"
-                    )
-                elif cls_globals is not None and cls_globals is not mod.__dict__:
-                    reasons.append(
-                        f"类血不同源：{getattr(cls, '__module__', '?')} 的类连着别的模块字典"
-                    )
-                # 【2026-09-19 补盲区】类血同源扩到整个 MRO。
-                # 病形：@llm_tool 的壳在 main.py，方法体却在 dispatch/router 等 Mixin
-                # 子模块里。旧 Mixin 混进新类 MRO 时，上面单类检查照样全绿——
-                # dispatch.py 模块对象确实是新的（P1 过），但类上挂的基类还是旧对象，
-                # 于是壳函数 super().xxx() 顺着旧 MRO 走到旧方法体。
-                # 实测 2026-09-19 17:34：给 _emit_results 补形参后热重载回执「完全生效」，
-                # 调工具仍报 name 'enable_segmented_forward' is not defined。
-                stale_bases = []
-                for _base in getattr(cls, "__mro__", ()):
-                    _bmod = str(getattr(_base, "__module__", "") or "")
-                    if not _bmod.startswith("data.plugins."):
-                        continue
-                    _bm = _sys.modules.get(_bmod)
-                    if _bm is None:
-                        continue
-                    if getattr(_bm, _base.__name__, None) is not _base:
-                        stale_bases.append(_base.__name__)
-                if stale_bases:
-                    reasons.append(
-                        f"类血不同源（MRO 旧血）：{'、'.join(stale_bases[:3])} "
-                        f"不是在线模块里的同一个类对象"
-                    )
-
-        # P4 子模块换血校验（2026-09-18 补盲区）：
-        # 实测「主模块换新、dispatch/router 等 Mixin 子模块旧血」三判据全绿——
-        # P1 的 swapped>=1 即放行，旧 Mixin 混进新类 MRO 无人查。对 MRO 上每个
-        # 归属本插件的基类（快照里有其模块的），比对模块对象 id 是否换新，
-        # 未换新即判败 → 调用方升级全量。
-        if old_ids and cls is not None:
-            stale_mixins = []
-            for klass in getattr(cls, "__mro__", ()):
-                mname = str(getattr(klass, "__module__", "") or "")
-                if not mname:
-                    continue
-                oid = old_ids.get(mname)
-                if oid is None:
-                    continue
-                cur = _sys.modules.get(mname)
-                # 【2026-09-19 补洞】旧模块已被 purge 出 sys.modules 时 cur is None，
-                # 原判据 `cur is not None and id(cur) == oid` 直接 continue → 旧 Mixin
-                # 彻底隐身。而模块从 sys.modules 消失本身就是强 stale 信号：类上若还
-                # 挂着那个模块里的类对象，它一定没有在线的同源对应。
-                if cur is None or id(cur) == oid:
-                    stale_mixins.append(mname.rsplit(".", 1)[-1])
-            if stale_mixins:
-                reasons.append(
-                    f"P4 子模块未换血（Mixin 旧血混入 MRO）：{'、'.join(stale_mixins[:3])}"
-                )
-
-        if len(metas) > 1:
-            reasons.append(f"注册表里该插件有 {len(metas)} 条条目（重复注册）")
-        star_cls = getattr(meta, "star_cls", None)
-        if star_cls is None:
-            reasons.append("实例未重建（star_cls 为空）")
-        elif cls is not None and type(star_cls) is not cls:
-            reasons.append("实例类型与注册类不一致（新旧类混用）")
-
-        if reasons:
-            return {"ok": False, "reasons": reasons[:4]}
-        return {
-            "ok": True,
-            "detail": f"模块换新 {swapped}/{len(old_ids)}、类血同源、注册表唯一",
-        }
-
-    async def _quick_target_reload(self, plugin_key: str, module_snapshot: dict):
-        """方案 B 定向快路径：只终止并重导目标插件，其余插件原地不动。
-
-        走 core 的 `load(specified_dir_name=目录名)`，不是 `reload(名字)`：
-        后者第一步要在 star_registry 里按名字找回 module_path，而我们的摘表刀
-        已经把这条摘了 → specified_module_path 保持 None → 自动退化成全量
-        （这就是「为什么每次都全量」的隐藏联动）。load(目录名) 只 import 那一个
-        目录（star_manager.load 里的 specified_dir_name 分支），三张表一张不碰。
-
-        终止旧实例得自己做 —— core 只在那条退化前的指定分支里 terminate，而我们
-        绕开的正是它。`_terminate_plugin` 是 core 私有 API，这里与摘表/摘绑定
-        同源使用，异常一律不抛出（终止失败也要继续重导）。
-
-        Returns:
-            (ok, note)：ok=False 时调用方必须升级全量，且本次快路径结果不采信。
-        """
-        pm = self._get_pm()
-        metas = self._match_plugin_metas(plugin_key)
-        if not metas:
-            return False, "\n⇢ 定向快路径：注册表无该插件条目（疑似未安装或已禁用）"
-        dir_name = self._resolve_target_dir(plugin_key)
-        if not dir_name:
-            return False, "\n⇢ 定向快路径：拿不到插件目录名"
-
-        for _path, meta in metas:
-            try:
-                await pm._terminate_plugin(meta)
-            except Exception as e:
-                logger.warning(
-                    f"[插件管理] 快路径终止旧实例异常（继续重导）：{type(e).__name__}: {e}"
-                )
-
-        # ── 快路径专用摘表（2026-09-16 从 _evict_plugin_bindings 挪入）──
-        # core load() 的路径是「if path in star_map: 直接复用旧 star_cls_type」，
-        # 不摘掉旧条目，新 import 的类注册不进去（2026-09-15 假绿根因）。
-        # 全量兜底走 reload(None)，core 自己 star_map.clear()，不需要这里动手。
-        # 必须在 terminate 之后、load 之前摘——查表(779)/terminate 都要靠旧条目活着。
-        pkey = str(plugin_key or "").strip().lower()
-        star_removed = 0
-        star_keys = []
-        try:
-            from astrbot.core.star.star import star_map as _sm, star_registry as _sr
-
-            for _path, _meta in list(_sm.items()):
-                mp = str(getattr(_meta, "module_path", "") or "").lower()
-                cls = getattr(_meta, "star_cls_type", None)
-                if pkey not in mp and not (
-                    cls is not None and pkey in str(getattr(cls, "__module__", "")).lower()
-                ):
-                    continue
-                try:
-                    # 按「值同一性」摘，不再靠 key 猜。
-                    # 2026-09-17 复核更正：star_map 的真实 key 就是 module_path
-                    # （core load() 里 path = "data.plugins." + 目录名 + "." + 模块名，
-                    # 由 __init_subclass__ 写进去，实测日志 key=['data.plugins.
-                    # astrbot_plugin_skill_cache_guard.main']）—— 老写法
-                    # `if mpth in _sm: del _sm[mpth]` 其实是删得掉的，先前记的
-                    # 「main@data.plugins.X.main」形态之说不成立，_match_plugin_metas
-                    # 里那段 @ 拆解逻辑也是基于错误观察写的（待重审）。
-                    # 这里改按值删只图一件事：即便 core 今后改命名口径，也不会静默漏摘表。
-                    for _k, _v in list(_sm.items()):
-                        if _v is _meta:
-                            del _sm[_k]
-                            star_keys.append(str(_k))
-                    _sr.remove(_meta)
-                    star_removed += 1
-                except Exception:
-                    pass
-            if star_removed:
-                logger.warning(
-                    f"[插件管理] 快路径重导前摘除 star_map/star_registry "
-                    f"{star_removed} 个（star_map key={star_keys}）"
-                )
-        except Exception as _sm_e:
-            logger.warning(
-                f"[插件管理] 快路径摘表异常（继续重导）：{type(_sm_e).__name__}: {_sm_e}"
-            )
-
-        t1 = time.monotonic()
-        try:
-            ok, err = await pm.load(specified_dir_name=dir_name)
-        except Exception as e:
-            ok, err = False, f"{type(e).__name__}: {e}"
-        cost = time.monotonic() - t1
-        if not ok:
-            return False, f"\n⇢ 定向快路径：load({dir_name}) 失败：{err}（{cost:.2f}s）"
-
-        chk = self._verify_quick_swap(plugin_key, module_snapshot)
-        if not chk.get("ok"):
-            why = "；".join(chk.get("reasons", [])[:3])
-            return False, f"\n⇢ 定向快路径：三判据探针未过（{why}），耗时 {cost:.2f}s"
-        logger.info(
-            f"[插件管理] 定向快路径通过：{plugin_key} {chk.get('detail', '')}（{cost:.2f}s）"
-        )
-        return True, (
-            f"\n⇢ 路径：定向快路径（只重导 {dir_name}，其余插件未动，{cost:.2f}s）"
-            f"\n   探针：{chk.get('detail', '')}"
         )
 
     def _purge_plugin_modules(self, plugin_key: str):
@@ -1076,11 +760,9 @@ class PluginManager(Star):
                 f"[插件管理] 重载前摘除旧绑定：tool×{n_tools} handler×{n_handlers} {samples}"
             )
 
-        # 第三张表（star_map/star_registry）的摘除已挪进 _quick_target_reload：
-        # 它是快路径 load(specified_dir_name) 的前置条件，而 evict 在快路径查表
-        # 之前跑——提前摘掉 star_map 会让快路径查表必然扑空（2026-09-16 两次
-        # 「注册表无该插件条目」的真因之一）。全量兜底走 reload(None)，core 自己
-        # star_map.clear()，无需这里动手。
+        # 这里只摘 tools/handlers 两张表。star_map/star_registry 不在这动手：
+        # 全量 reload(None) 走 core 自己的 star_map.clear() + star_registry.clear()
+        # + __init_subclass 重新注册，提前摘反而多余（2026-09-25 撤快路径后）。
         return {
             "tools": n_tools,
             "handlers": n_handlers,
@@ -1773,18 +1455,147 @@ class PluginManager(Star):
             + "\n   → 这些链路本次重载不会换血，行为可能仍是旧代码；功能没变就得重启 AstrBot"
         )
 
+    def _collect_identity(self, plugin_key: str) -> dict:
+        """采集目标插件当前的对象身份，供换代自检做前后比对（2026-09-25）。
+
+        三层：模块对象 / 插件类 / 插件实例，全部取解释器当场给出的 id()。
+
+        为何用 id()：判「有没有换血」原先靠 _tag_freshness 认子模块里手写的
+        RUNTIME_BUILD_TAG —— 判据要人维护，忘更新 tag 就误报未生效，只更
+        tag 而代码没换就漏报成生效。id() 由解释器给，零维护，也不指望被
+        重载的代码配合自报家门。
+
+        匹配口径：模块名按 data.plugins.<目录> 的目录段精确对齐，与
+        _resolve_plugin_key 输出同源，避免子串误匹配到别的插件。
+        """
+        import sys as _sys
+
+        key = str(plugin_key or "").strip().lower()
+        ids: dict = {"modules": {}, "cls": None, "inst": None}
+        if not key:
+            return ids
+        short = key[len("astrbot_plugin_"):] if key.startswith("astrbot_plugin_") else key
+        # 三种形态都收：内部名（astrbot_plugin_x）、短名（x）、短名补回前缀的变体。
+        # _resolve_plugin_key 给的可能是其中任一形态，而目录段永远带前缀——
+        # 只做「去前缀」会漏匹配（2026-09-25 03:48 实测：短名 key 采不到模块，
+        # 回执里那条自检默默消失，成了「沉默的假绿」）。
+        tokens = {t for t in (key, short, f"astrbot_plugin_{short}") if t}
+        try:
+            for mname, mod in list(_sys.modules.items()):
+                parts = mname.split(".")
+                if len(parts) < 3 or parts[0] != "data" or parts[1] != "plugins":
+                    continue
+                if parts[2].lower() not in tokens:
+                    continue
+                ids["modules"][mname] = id(mod)
+
+            _sm = _sys.modules.get("astrbot.core.star.star")
+            smap = getattr(_sm, "star_map", None) or {}
+            for _p, _smd in smap.items():
+                if str(getattr(_smd, "name", "") or "").lower() not in tokens:
+                    continue
+                _cls = getattr(_smd, "star_cls_type", None)
+                ids["cls"] = id(_cls) if _cls is not None else None
+                break
+
+            sreg = getattr(_sm, "star_registry", None) or []
+            for s in sreg:
+                if str(getattr(s, "name", "")).lower() in tokens:
+                    ids["inst"] = id(s)
+                    break
+        except Exception:
+            pass
+        return ids
+
+    def _audit_swap_identity(self, plugin_key: str, before: dict) -> dict:
+        """换代身份自检：用对象 id 判这次重载到底换没换血（2026-09-25 新增）。
+
+        替代原先的两条软判据：
+          · _tag_freshness      —— 认子模块里手写的 RUNTIME_BUILD_TAG，需人维护
+          · _runtime_self_stale —— 只比方法首行号，给签名加参数不位移任何行号，
+                                   零 stale，直接漏判成「完全生效」
+        两条都依赖「被重载的代码自己开口」，而代码没换时它开的口就是旧口径。
+
+        本方法只比较解释器给的 id()，读写都落在当前进程内存上——
+        因此不受「同一 loop 内工具 handler 是快照」影响：无论回执由哪一版
+        代码打印，读到的都是同一份真实内存。
+
+        已知假阴性：旧对象被彻底释放后新对象可能复用同一 id。所以
+        「id 没变」按存疑上报，不单凭 id 定生死。
+
+        Returns:
+            {"ok": True/False/None, "detail": str, "stale": [str, ...]}
+            ok=True  模块/类/实例三层全部换代
+            ok=False 至少一层未换代
+            ok=None  缺 before 或取不到目标，无法判定
+        """
+        key = str(plugin_key or "").strip().lower()
+        _before = (before or {}).get("identity") or {}
+        _b_mods = _before.get("modules") or {}
+        if not key:
+            return {"ok": None, "why": "plugin_key 为空", "detail": "", "stale": []}
+        if not _b_mods:
+            return {
+                "ok": None,
+                "why": "重载前快照没采到模块身份（before.identity.modules 为空）",
+                "detail": "",
+                "stale": [],
+            }
+
+        now = self._collect_identity(plugin_key)
+        _a_mods = now.get("modules") or {}
+        if not _a_mods:
+            return {
+                "ok": None,
+                "why": f"重载后采不到 {key} 的模块（sys.modules 里没有 data.plugins.<该目录>.*）",
+                "detail": "",
+                "stale": [],
+            }
+
+        stale = []
+        gone = [m for m in _b_mods if m not in _a_mods]
+        same = [m for m in _b_mods if _a_mods.get(m) == _b_mods[m]]
+        if gone:
+            stale.append(
+                f"模块层：{len(gone)} 个模块重载后已不在 sys.modules（{gone[0]} 等）"
+            )
+        if same:
+            stale.append(
+                f"模块层：{len(same)}/{len(_b_mods)} 个模块 id 未变"
+                f"（{same[0].rsplit('.', 1)[-1]} 等）"
+            )
+        cls_stale = _before.get("cls") is not None and now.get("cls") == _before.get("cls")
+        inst_stale = _before.get("inst") is not None and now.get("inst") == _before.get("inst")
+        if cls_stale:
+            stale.append("类层：star_cls_type 仍是重载前那个对象")
+        if inst_stale:
+            stale.append("实例层：star_registry 里该实例 id 未变")
+
+        swapped = len(_b_mods) - len(same) - len(gone)
+        detail = (
+            f"模块 {swapped}/{len(_b_mods)} 换代"
+            f"｜类 {'❌' if cls_stale else '✅'}"
+            f"｜实例 {'❌' if inst_stale else '✅'}"
+        )
+        return {"ok": not stale, "detail": detail, "stale": stale}
+
     def _snapshot_star(self, plugin_key: str) -> dict:
-        """取插件当前快照（版本/是否启用），供重载前后对比"""
+        """取插件当前快照（版本/启用状态/对象身份），供重载前后对比。
+
+        【2026-09-25】加 identity 层：模块 / 插件类 / 插件实例的 id()。
+        原先只记 version/activated 这类元数据，回答不了「代码到底换没换」。
+        """
+        snap: dict = {}
         try:
             for s in self.context.get_all_stars():
                 if getattr(s, "name", "") == plugin_key:
-                    return {
-                        "version": getattr(s, "version", None),
-                        "activated": bool(getattr(s, "activated", False)),
-                    }
+                    snap["version"] = getattr(s, "version", None)
+                    snap["activated"] = bool(getattr(s, "activated", False))
+                    break
         except Exception:
             pass
-        return {}
+        snap["identity"] = self._collect_identity(plugin_key)
+        return snap
 
     def _scan_unapplied_core_changes(self, limit: int = 5) -> list:
         """扫 astrbot/core 下「源文件比 .pyc 新」的模块 = 内存里跑的不是这份代码。
@@ -1834,7 +1645,12 @@ class PluginManager(Star):
         return [rel for _mt, rel in hits[:limit]]
 
     def _tag_freshness(self, plugin_key: str):
-        """runtime build 指纹判据（2026-09-16 00:26 假绿防护·硬判据）。
+        """runtime build 指纹判据（2026-09-16 00:26）。
+
+        【2026-09-25 停用】调用点已摘，由 _audit_swap_identity 取代。
+        留档原因：它认的是子模块里手写的 RUNTIME_BUILD_TAG —— 判据要人维护，
+        忘更新 tag 就误报未生效；只更 tag 而代码没换就漏报成已生效。
+        问嫌犯本人要口供，不如查解释器给的对象身份。
 
         判据：子模块类必须带 RUNTIME_BUILD_TAG 常量（如 dispatch.py 开头:
         RUNTIME_BUILD_TAG = "build-2026-09-16-0026-r10"）。
@@ -1903,6 +1719,10 @@ class PluginManager(Star):
 
     def _runtime_self_stale(self, plugin_key: str):
         """热重载后「类方法血」运行时验证（2026-09-16 00:02 产品化）。
+
+        【2026-09-25 停用】调用点已摘，由 _audit_swap_identity 取代。
+        留档原因：它只比方法首行号，给签名加一个参数不位移任何行号 →
+        零 stale → 直接漏判成「完全生效」，09-19 那次假绿就是这么骗过去的。
 
         背景：2026-09-15 深夜实证三轮（·r6 绿 / ·r7、·r8 未绿），仅凭「模块缓
         存清理 + 绑定自检 + 长活自检全绿」不足以判定插件类方法真的换了血，
@@ -2017,7 +1837,8 @@ class PluginManager(Star):
         except Exception as _rt_e:
             return {"ok": None, "err": f"{type(_rt_e).__name__}: {_rt_e}"}
 
-    def _grade_reload_effect(self, success, live_note, core_stale, plugin_key=None) -> str:
+    def _grade_reload_effect(self, success, live_note, core_stale, plugin_key=None,
+                             before=None) -> str:
         """把「这次重载到底生效到哪一层」写成一行结论（一期：生效度评分）。
 
         分层判据（与规划文档 L0-L4 对应）：
@@ -2036,36 +1857,57 @@ class PluginManager(Star):
         else:
             head = "🧭 生效度：✅ 完全生效（模块/绑定/长活对象均指向当前代码）"
         out = [head]
-        # ── 2026-09-16 第五层：运行时类方法换血验证（假绿防护） ──
+        # ── 2026-09-25 第五层换成硬判据：换代身份自检（对象 id 前后比对） ──
+        # 原先两条是软判据，都依赖「被重载的代码自己开口」，等于向嫌犯本人取口供：
+        #   · _tag_freshness      认子模块里手写的 RUNTIME_BUILD_TAG，忘更新就误报
+        #   · _runtime_self_stale 只比方法首行号，给签名加参数不位移任何行号，漏判
+        # 换成 id() 比对：解释器当场给，零维护；读写都在当前进程内存上，
+        # 因此不受「同一 loop 内工具 handler 是快照」影响——回执由哪一版代码
+        # 打印都一样，读到的都是同一份真实内存。
         # 兼容缺省 plugin_key：只有显式指定插件重载时才做，全量重载不做（怕拖慢回执）。
         if plugin_key and success:
-            _rt = self._tag_freshness(plugin_key)
-            if _rt.get("ok") is None:
-                _rt = self._runtime_self_stale(plugin_key)
-            # 【2026-09-19 补盲区】上面两条探针双盲：_tag_freshness 认类属性
-            # （插件给的是模块级常量 → 取到 0 个 → 返回 ok=None 直接跳过），
-            # _runtime_self_stale 只比方法首行号（给签名加参数不位移任何行号
-            # → 零 stale → 判「完全生效」）。而真凶是 MRO 上挂着旧 Mixin 类对象。
-            if _rt.get("ok") is not False:
-                _mro_stale = self._audit_mro_stale(plugin_key)
-                if _mro_stale:
-                    _rt = {
-                        "ok": False,
-                        "stale": [
-                            f"{_n}：Mixin 类对象仍是旧版本（方法体在子模块里，"
-                            f"壳函数在 main.py 所以绑定自检查不到）"
-                            for _n in _mro_stale
-                        ],
-                    }
-            if _rt.get("ok") is False:
+            _id_r = self._audit_swap_identity(plugin_key, before)
+            if _id_r.get("ok") is None:
+                # 判不了也必须开口：默认沉默＝回执看着全绿而自检压根没跑成，
+                # 这正是「沉默的假绿」，比误报更难查。
+                out.append(
+                    f"🔬 换代身份自检：⚠️ 无法判定——"
+                    f"{_id_r.get('why') or '未采到目标对象身份'}"
+                )
+            if _id_r.get("ok") is False:
+                head = (
+                    "🧭 生效度：⚠️ 部分生效——有对象没换代"
+                    "（即「假绿」，运行时验证未通过）"
+                )
+                out = [head]
+                out.append(f"   判据：{_id_r.get('detail') or '—'}")
+                out.append("🚨 必须重启：本次热重载没能换掉这些对象：")
+                for _s in _id_r.get("stale") or []:
+                    out.append(f"    · {_s}")
+                out.append(
+                    "🤖 请把这份结论原样通知用户/AI 操作者：插件已热重载但部分对象"
+                )
+                out.append(
+                    "    仍是旧版本，需要手动重启 AstrBot 后再重载一次，才能真正生效。"
+                )
+                return "\n" + "\n".join(out)
+            if _id_r.get("ok") is True:
+                out.append(f"🔬 换代身份自检：{_id_r.get('detail')}")
+            # MRO 复核：identity 只看模块/类/实例三层对象，MRO 上挂着的旧 Mixin
+            # 基类若已不在注册表指向的位置，仍要单独抓出来（09-19 的盲区）。
+            _mro_stale = self._audit_mro_stale(plugin_key)
+            if _mro_stale:
                 head = (
                     "🧭 生效度：⚠️ 部分生效——模块/绑定已换血，但运行时类方法仍是旧版本"
                     "（即「假绿」，运行时验证未通过）"
                 )
                 out = [head]
                 out.append("🚨 必须重启：本次热重载没能把这些类方法换血成功：")
-                for _s in _rt["stale"]:
-                    out.append(f"    · {_s}")
+                for _n in _mro_stale:
+                    out.append(
+                        f"    · {_n}：Mixin 类对象仍是旧版本"
+                        f"（方法体在子模块里，壳函数在 main.py 所以绑定自检查不到）"
+                    )
                 out.append(
                     "🤖 请把这份结论原样通知用户/AI 操作者：插件已热重载但部分类方法"
                 )
