@@ -1,4 +1,6 @@
 import functools
+import os
+import re
 import time
 
 from astrbot.api.event import filter, AstrMessageEvent
@@ -22,49 +24,83 @@ _RELOAD_LOG_HINTS = (
     "error", "traceback", "failed", "失败", "no module", "importerror", "syntaxerror",
 )
 
+# 落盘日志（astrbot.log）带 ANSI 色码，解析前先剥掉；再按级别标记切成 (level, message)
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_LOG_LEVEL_RE = re.compile(
+    r"\[(TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL)\]\s*(.+)$", re.S
+)
+
 
 class _ReloadLogCapture:
-    """捕获一次热重载窗口内的日志。
+    """捕获一次热重载窗口内的日志——读 AstrBot 落盘日志的字节增量。
 
-    AstrBot 的 astrbot.* logger 全是 propagate=False（core/log.py GetLogger），
-    挂 root handler 一条也收不到；所有记录经 intercept handler 汇入 loguru，
-    所以改挂 loguru sink（实测：挂 root 时回执显示「日志 0 行」）。
+    [2026-09-25 市场审核整改] 原先在第三方日志库上挂 sink 捕获，因「日志记录器
+    必须且只能从 astrbot.api 导入」的规定被驳回。实测 astrbot.api.logger 是代理类，
+    转发给 LogManager.get_plugin_logger()，拿回来的是标准库 logging.Logger，
+    既没有 add/remove 这类 sink 概念，也只收本插件自己的记录；而核心 logger
+    又全是 propagate=False（core/log.py GetLogger），挂 root handler 同样收不到。
+    所以放弃在进程内挂钩子，改读 AstrBot 落盘日志（astrbot.log）的增量：
+    纯标准库、零第三方依赖，start() 记末尾偏移，stop() 只解析这段新增内容。
+    代价是回执日志比实时晚一个写盘周期，够用。
     """
 
     def __init__(self):
         self.lines = []  # [(levelname, message)]
-        self._sink_id = None
+        self._path = None
+        self._offset = 0
+
+    @staticmethod
+    def _candidate_paths():
+        """AstrBot 落盘日志的候选位置（相对本插件目录向上找到项目根）"""
+        here = os.path.dirname(os.path.abspath(__file__))
+        root = os.path.abspath(os.path.join(here, "..", "..", ".."))
+        return (
+            os.path.join(root, "astrbot.log"),
+            os.path.join(root, "data", "logs", "astrbot.log"),
+        )
 
     def start(self):
-        try:
-            from loguru import logger as _loguru
-
-            self._sink_id = _loguru.add(
-                self._emit,
-                level="INFO",
-                format="{level}|{message}",
-                colorize=False,
-            )
-        except Exception:
-            self._sink_id = None
+        """记下当前文件末尾偏移，作为本次重载窗口的增量起点"""
+        self.lines = []
+        self._path = None
+        self._offset = 0
+        for path in self._candidate_paths():
+            try:
+                if os.path.isfile(path):
+                    self._path = path
+                    self._offset = os.path.getsize(path)
+                    return
+            except OSError:
+                continue
 
     def stop(self):
-        if self._sink_id is None:
+        if not self._path:
             return
         try:
-            from loguru import logger as _loguru
+            size = os.path.getsize(self._path)
+            if size < self._offset:
+                # 日志被轮转/截断过，整段都可能丢，只能从头看起
+                self._offset = 0
+            if size <= self._offset:
+                return
+            with open(self._path, "r", encoding="utf-8", errors="replace") as f:
+                f.seek(self._offset)
+                chunk = f.read()
+            self._offset = size
+        except OSError:
+            return
+        self._parse(chunk)
 
-            _loguru.remove(self._sink_id)
-        except Exception:
-            pass
-        self._sink_id = None
-
-    def _emit(self, message):
-        try:
-            level, _, msg = str(message).partition("|")
-            self.lines.append((level.strip(), msg.strip()))
-        except Exception:
-            pass
+    def _parse(self, chunk: str):
+        """把落盘文本拆成 (level, message)；剥掉 ANSI 色码后按级别标记切分"""
+        for raw in chunk.splitlines():
+            line = _ANSI_RE.sub("", raw).strip()
+            if not line:
+                continue
+            found = _LOG_LEVEL_RE.search(line)
+            if not found:
+                continue
+            self.lines.append((found.group(1), found.group(2).strip()))
 
 
 def _normalize_plugin_name(s) -> str:
@@ -105,7 +141,7 @@ def _plugin_name_hint(query, registry, reason: str = "") -> str:
     "astrbot_plugin_auto_reload",
     "hypxtmc",
     "在聊天中管理 AstrBot 插件：查看列表、启停、重载（含平台换手/陈旧任务回收/生效度评分）、安装、卸载、更新",
-    "1.4.0",
+    "1.4.1",
     "",
 )
 class PluginManager(Star):
@@ -2242,11 +2278,50 @@ class PluginManager(Star):
         cfg.setdefault("agents", [])
         return cfg
 
+    # prompt 文件只允许落在下列目录内（相对项目根）。[2026-09-25 市场审核整改]
+    _PROMPT_FILE_ROOTS = ("data/plugin_data/astrbot_plugin_auto_reload",)
+
+    @classmethod
+    def _prompt_file_roots(cls) -> tuple:
+        here = os.path.dirname(os.path.abspath(__file__))
+        bot_root = os.path.abspath(os.path.join(here, "..", "..", ".."))
+        return tuple(os.path.join(bot_root, r) for r in cls._PROMPT_FILE_ROOTS)
+
+    @classmethod
+    def _resolve_prompt_file(cls, rel: str) -> str:
+        """把 file: 后面的路径解析到插件数据目录内的真实文件。
+
+        只认插件自己数据目录里的文件，且需经 realpath 归一化后仍落在该目录内：
+        绝对路径指向外部、`..` 向上穿越、经符号链接跳出，一律拒绝——
+        否则这个入参会退化成任意文件读取原语。
+        """
+        if not rel:
+            raise ValueError("file: 后面缺少路径")
+        roots = cls._prompt_file_roots()
+        cands = [rel] if os.path.isabs(rel) else [os.path.join(r, rel) for r in roots]
+        for cand in cands:
+            try:
+                real = os.path.realpath(cand)
+            except OSError:
+                continue
+            for root in roots:
+                try:
+                    real_root = os.path.realpath(root)
+                except OSError:
+                    continue
+                if real == real_root or real.startswith(real_root + os.sep):
+                    if os.path.isfile(real):
+                        return real
+        raise ValueError(
+            "prompt 文件必须放在插件数据目录内（%s）：%s" % ("、".join(roots), rel)
+        )
+
     async def _ensure_persona(self, persona_id, persona_prompt=None, description=None):
         """确保 persona 存在于内存/DB，不存在则创建（可带 prompt）。返回 (existed, persona)"""
-        # 支持 file: 前缀从文件读取 prompt——大 prompt 走 LLM 工具参数会被截断，必须走文件
+        # 支持 file: 前缀从文件读取 prompt——大 prompt 走 LLM 工具参数会被截断，必须走文件。
+        # 路径限制在插件自己的数据目录内，见 _resolve_prompt_file。
         if persona_prompt and persona_prompt.startswith("file:"):
-            _fp = persona_prompt[5:].strip()
+            _fp = self._resolve_prompt_file(persona_prompt[5:].strip())
             try:
                 with open(_fp, "r", encoding="utf-8") as _f:
                     persona_prompt = _f.read()
