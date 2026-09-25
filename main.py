@@ -171,7 +171,12 @@ class PluginManager(Star):
 
     # 活对象台账上限（按对象个数算，不是按代）。一个 loop 的生命周期是秒级，
     # 留这么多足够覆盖同会话里的历史 loop；超了裁掉最老的。
-    _LIVE_LEDGER_MAX = 64
+    #
+    # 【为什么是 256】台账里每个对象都占一个强引用，因此它永远不会被 GC，
+    # 只能靠这个上限封顶（FunctionTool 是 pydantic dataclass，挂不了弱引用）。
+    # 每次重载约追加 6 个，256 相当于能吞下 40 次重载 —— 而裁掉的是最老的，
+    # 最老的恰恰可能是某个还活着的 loop 手里那个。所以上限不能小。
+    _LIVE_LEDGER_MAX = 256
 
     def _live_ledger(self, plugin_key: str) -> list:
         """取（或建）跨重载存活的活对象台账：[tool_obj, ...]。
