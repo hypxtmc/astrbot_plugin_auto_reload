@@ -316,8 +316,15 @@ class PluginManager(Star):
             except Exception:
                 stale.append(_name)
 
+        # 【计数口径】分母只算「台账里有对应新对象的」那些。台账是跨重载累积的，
+        # 里面可能残留「工具已被删/改名」的历史代对象 —— 它们在 func_list 里找不到
+        # 同名新对象，属于正常下线，被 continue 跳过。把它们计进分母，回执就成了
+        # 72/73，看着像有一个没换成功，是假红（2026-09-25 实测复现）。所以分开报。
         total = len(captured)
-        parts = [f"\n🫀 就地换血：{swapped}/{total} 个工具 handler 已就地指向新代码"]
+        offline = total - swapped - len(stale)
+        parts = [f"\n🫀 就地换血：{swapped}/{total - offline} 个工具 handler 已就地指向新代码"]
+        if offline > 0:
+            parts.append(f"｜另有 {offline} 个历史对象对应的工具已下线，跳过")
         if swapped:
             parts.append("→ 本条消息里的下一条工具调用即用新版，无需再开口")
         if stale:
