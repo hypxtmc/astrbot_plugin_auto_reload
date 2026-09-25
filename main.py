@@ -326,7 +326,15 @@ class PluginManager(Star):
         if offline > 0:
             parts.append(f"｜另有 {offline} 个历史对象对应的工具已下线，跳过")
         if swapped:
-            parts.append("→ 本条消息里的下一条工具调用即用新版，无需再开口")
+            parts.append("\n→ 本条消息里的下一条工具调用即用新版 handler")
+            # 【保守承诺】换血覆盖的是 llm_tools 里各 tool 对象的 .handler；而工具
+            # 描述与参数 schema 是注册时解析好、存在 tool 对象上的，本轮 loop 开头
+            # 那份快照还是旧的。要让「完全」（连描述和 schema 一起）落到用户眼前，
+            # 最稳的是让他再说一句话、开一个新 loop —— 2026-09-25 博士要求写进回执。
+            parts.append(
+                "\n→ 要确保「完全」重载（工具描述与参数 schema 一并刷新），"
+                "让用户再说一句话触发新 loop 最稳妥"
+            )
         if stale:
             parts.append(
                 f"\n   ⚠️ {len(stale)} 个替换后身份仍不一致：{', '.join(stale[:5])}"
