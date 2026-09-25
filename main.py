@@ -105,7 +105,7 @@ def _plugin_name_hint(query, registry, reason: str = "") -> str:
     "astrbot_plugin_auto_reload",
     "hypxtmc",
     "在聊天中管理 AstrBot 插件：查看列表、启停、重载（含平台换手/陈旧任务回收/生效度评分）、安装、卸载、更新",
-    "1.3.0",
+    "1.4.0",
     "",
 )
 class PluginManager(Star):
@@ -114,105 +114,212 @@ class PluginManager(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
-        # 重载成功后登记待复核项：{plugin_key: True}。
-        # on_llm_request 钩子只在非空时工作，空表时零开销。
-        self._pending_swap: dict = {}
-        # 钩子是否已自证上线：注册本身不打日志，靠首次被调用来证明。
-        self._handler_hooked = False
 
-    # ─────────────────────────────
-    # on_llm_request 就地换血（2026-09-25）
-    # ─────────────────────────────
-
-    @filter.on_llm_request()
-    async def _sync_stale_handlers(self, event: AstrMessageEvent, req) -> None:
-        """请求 LLM 前，把工具表里残留的旧 handler 就地换成内存里的最新版。
-
-        【为何加这一层】工具 handler 在对话轮开头被收集成快照，此后无论重载
-        多少次，同一轮里拿到的都是那批旧函数对象——这是「假绿」的通道，也是
-        「验一次要等对方再开口」的根。
-
-        而 on_llm_request 是插件还能动手的最后一站：core 在 build_main_agent
-        阶段填好 req.func_tool，随后触发本钩子，最后才交给 provider。在这一步
-        换掉，本次调用就用新代码——不必等下一轮，也不必谁再开口。
-
-        判据照旧不吃快照：从 core 的 handler 注册表按模块路径取最新 handler，
-        与工具表里那个比底层函数对象身份，不同即换。注册表在重载当场更新，
-        所以它永远反映磁盘最新代码。
-
-        空表时零开销：只有重载成功后才会登记待复核项。
-        """
-        # 钩子注册（get_handler_or_create）不打日志，靠首次被调用来证明它确实挂上了。
-        if not self._handler_hooked:
-            self._handler_hooked = True
-            logger.info(
-                "[插件管理] on_llm_request 钩子已上线："
-                "重载后不必等待，本轮即可换血"
-            )
-        if not self._pending_swap:
-            return
-        try:
-            tools = list(
-                getattr(getattr(req, "func_tool", None), "tools", None) or []
-            )
-            if not tools:
-                return
-            from astrbot.core.star.star_handler import star_handlers_registry as _reg
-
-            swapped, checked = 0, 0
-            for _t in tools:
-                _mp = str(getattr(_t, "handler_module_path", "") or "")
-                if not _mp:
-                    continue
-                _low = _mp.lower()
-                if not any(
-                    _low.endswith(_k) or _k in _low for _k in self._pending_swap
-                ):
-                    continue
-                checked += 1
-                for _md in _reg.get_handlers_by_module_name(_mp) or []:
-                    if getattr(_md, "handler_name", None) != getattr(_t, "name", None):
-                        continue
-                    _new = getattr(_md, "handler", None)
-                    if _new is None:
-                        break
-                    if self._unwrap_handler(_t.handler) is self._unwrap_handler(_new):
-                        break
-                    _t.handler = self._rewrap_handler(_t.handler, _new)
-                    swapped += 1
-                    break
-            if swapped:
-                logger.info(
-                    f"[插件管理] on_llm_request 就地换血成功：{swapped}/{checked} 个"
-                    f"工具 handler 已指向内存最新版，本轮即可用，无需等待"
-                )
-                self._pending_swap.clear()
-            elif checked:
-                logger.info(
-                    f"[插件管理] on_llm_request 复核 {checked} 个工具："
-                    f"handler 已是最新，无需替换"
-                )
-                self._pending_swap.clear()
-        except Exception:
-            logger.exception("[插件管理] on_llm_request 就地换血失败")
+    # ────────────────────────────────────────────────────
+    # 活对象就地换血（2026-09-25 v1.4.0，替代 on_llm_request 钩子）
+    # ────────────────────────────────────────────────────
+    #
+    # 【为什么钩子方案被撤掉】v1.3.0 在 on_llm_request 里换血，实测从未生效：
+    # 全量日志里「换血成功」与「复核 N 个工具」出现 0 次。两处硬伤——
+    #   ① 时机：core 的 on_llm_request 每条消息只触发一次，且在工具表刚构建完、
+    #      任何工具都还没调的那一刻。而重载发生在消息处理中途，那时钩子早跑完了，
+    #      这一轮再没有第二次触发机会 —— 「本轮即可换血」物理上不成立。
+    #   ② 归属：待换登记写在 self._pending_swap（实例属性）上，重载会把实例整个
+    #      换掉，新实例那张表是空的。登记的人和读表的人不是一个实例。
+    #
+    # 【为什么重载当场就能换成】core 的执行链全程**实时读属性**，不是快照：
+    #   · tool_loop_agent_runner 每次调用都 req.func_tool.get_tool(name) 现查
+    #   · FunctionToolExecutor._execute_local 里 `if tool.handler:` 现读
+    #   · _PermissionGuardedTool.call 里 `self._wrapped.handler` 现读
+    # 真正被冻住的只有 req.func_tool 里那批 **tool 对象引用**（本轮构建后不变）。
+    # 所以：重载前抓住那批对象 → 重载后原地改它的 .handler → 下一条工具调用
+    # 立刻用新代码。不需要钩子，不需要等下一轮，也不需要谁再开口。
 
     @staticmethod
-    def _unwrap_handler(h):
-        """剥掉 functools.partial 包装，取出底层函数对象用于身份比对。"""
+    def _tool_belongs(tool, key: str) -> bool:
+        """判定 tool 是否属于该插件（与 _evict_plugin_bindings 内的 _belongs 同构）。
+
+        两层兑底：模块路径含内部名 → 函数 __globals__['__file__'] 含内部名。
+        core 重建过绑定、或显式 append 注册的条目，handler_module_path 可能为空。
+        """
+        if not key:
+            return False
+        _mp = str(getattr(tool, "handler_module_path", "") or "").lower()
+        if key in _mp:
+            return True
+        for _attr in ("handler", "func", "callback", "func_obj"):
+            _f = getattr(tool, _attr, None)
+            if isinstance(_f, functools.partial):
+                _f = _f.func
+            if callable(_f):
+                _g = getattr(_f, "__globals__", None)
+                if isinstance(_g, dict) and key in str(_g.get("__file__", "")).lower():
+                    return True
+                break
+        return False
+
+    @staticmethod
+    def _fn_identity(h):
+        """取 handler 的底层函数对象，用于身份比对。
+
+        core 绑实例用的是 functools.partial(裸函数, 实例)，不是 bound method；
+        不解包的话比的是 partial 包装对象，每次都"不同"，等于没比。
+        """
         while isinstance(h, functools.partial):
             h = h.func
-        return h
+        return getattr(h, "__func__", h)
 
-    @staticmethod
-    def _rewrap_handler(orig, new):
-        """按 orig 的包装结构把 new 包回去，保持原有调用约定。
+    # 活对象台账上限（按对象个数算，不是按代）。一个 loop 的生命周期是秒级，
+    # 留这么多足够覆盖同会话里的历史 loop；超了裁掉最老的。
+    _LIVE_LEDGER_MAX = 64
 
-        partial 会自动展平，`partial(partial(f, 1), c=3)` 在构造时就变成
-        `partial(f, 1, c=3)`，嵌套结构不会留在对象里，所以这里一层就够。
+    def _live_ledger(self, plugin_key: str) -> list:
+        """取（或建）跨重载存活的活对象台账：[tool_obj, ...]。
+
+        【为什么台账不能放在插件自己这儿】重载会把插件模块整个换掉，模块级
+        变量随之重置，台账会丢。core 的 llm_tools 是单例，插件重载不碰它，
+        所以挂在它身上能活过任意次重载。属性名带插件前缀，便于日后清理。
+
+        【为什么必须跨重载存活】req.func_tool 里那个对象只在「本轮 loop 开头」
+        从 func_list 取过一次，之后就与 func_list 脱钩了（每次重载 core 都会把
+        func_list 换成新对象）。只认 func_list 的话，第二次重载开始就再也抓不到
+        本轮真正在用的那个对象 —— 回执照样写「已换血」，而本轮跑的仍是旧的，
+        正好又是一次假绿。
+
+        【为什么按对象堆表、不按名字只留一个】活着的 loop 可能不止一个（多会话
+        并发），它们手里攥的是不同代的对象，每一个都得刷到。按名字只留最早那个，
+        会把新 loop 正在用的对象挡在外面。
+
+        【为什么不用 WeakSet】FunctionTool 是 pydantic dataclass，没开
+        weakref_slot，挂不了弱引用。改用「追加 + 上限裁剪」，够用且可控。
         """
-        if isinstance(orig, functools.partial):
-            return functools.partial(new, *orig.args, **(orig.keywords or {}))
-        return new
+        key = str(plugin_key or "").strip().lower()
+        if not key:
+            return []
+        try:
+            from astrbot.core.provider.register import llm_tools as _lt
+        except Exception:
+            return []
+        ledger = getattr(_lt, "_auto_reload_live_ledger", None)
+        if not isinstance(ledger, dict):
+            ledger = {}
+            try:
+                setattr(_lt, "_auto_reload_live_ledger", ledger)
+            except Exception:
+                return []
+        bucket = ledger.get(key)
+        if not isinstance(bucket, list):
+            bucket = []
+            ledger[key] = bucket
+        return bucket
+
+    def _capture_live_tools(self, plugin_key: str) -> list:
+        """重载前：把本插件的 tool 对象收齐 —— 本次 func_list 里的，加上台账里
+        此前几代仍可能被活着的 loop 攥着的。
+
+        【为什么必须先抓】已构建好的 req.func_tool 里装的是 _PermissionGuardedTool
+        代理，它的内层 self._wrapped 直接指向 func_list 里那个裸 FunctionTool。
+        重载时 _evict_plugin_bindings 会把这些旧对象从 func_list 里 remove 掉，
+        之后再想按名字把它们找回来就找不到了 —— 而它们恰恰是「正在跑的这一轮」
+        手里攥着的对象。
+
+        Returns:
+            [tool_obj, ...]（对象引用，不拷贝）
+        """
+        key = str(plugin_key or "").strip().lower()
+        if not key:
+            return []
+        ledger = self._live_ledger(key)
+        try:
+            from astrbot.core.provider.register import llm_tools as _lt
+        except Exception:
+            return list(ledger)
+        known = {id(_o) for _o in ledger}
+        for _t in list(getattr(_lt, "func_list", None) or []):
+            try:
+                if not self._tool_belongs(_t, key) or id(_t) in known:
+                    continue
+                ledger.append(_t)
+                known.add(id(_t))
+            except Exception:
+                continue
+        _max = int(self._LIVE_LEDGER_MAX)
+        if len(ledger) > _max:
+            del ledger[: len(ledger) - _max]
+        return list(ledger)
+
+    def _swap_live_handlers(self, captured: list, plugin_key: str) -> str:
+        """重载后：把旧 tool 对象上的 handler 就地换成新代码，下一条调用即生效。
+
+        只动对象属性，不换对象 —— 这一点是关键：req.func_tool 里的代理内层指着
+        的正是这批旧对象，对象一换，代理就指不到了，换血也就落空。
+
+        captured 是台账全量（可能含几代历史对象）。每个都刷一遍：活着的 loop
+        攥的是哪一代就刷哪一代，不靠猜。
+
+        判据不吃快照：换完当场比对新旧 handler 的底层函数对象身份，结果直接写进
+        回执。不靠「等下次调用看看」，也不靠被重载的代码自己开口自证。
+        """
+        key = str(plugin_key or "").strip().lower()
+        if not key:
+            return ""
+        if not captured:
+            return "\n🫀 就地换血：本插件未注册 llm_tool，无需换血"
+        try:
+            from astrbot.core.provider.register import llm_tools as _lt
+        except Exception as _e:
+            return f"\n🫀 就地换血：⚠️ 取不到 llm_tools：{type(_e).__name__}: {_e}"
+
+        old_ids = {id(_o) for _o in captured}
+        fresh: dict = {}
+        for _t in list(getattr(_lt, "func_list", None) or []):
+            try:
+                if id(_t) in old_ids:
+                    continue  # 旧对象没摘干净，跳过，免得自比自
+                _nm = str(getattr(_t, "name", "") or "")
+                if _nm and self._tool_belongs(_t, key):
+                    fresh[_nm] = _t
+            except Exception:
+                continue
+
+        swapped, stale = 0, []
+        for _old in captured:
+            _name = str(getattr(_old, "name", "") or "")
+            _new = fresh.get(_name)
+            if _new is None:
+                continue  # 工具已删/改名：老对象没人再用，静默跳过，不制造假警报
+            _new_h = getattr(_new, "handler", None)
+            if _new_h is None:
+                continue
+            if self._fn_identity(getattr(_old, "handler", None)) is self._fn_identity(_new_h):
+                continue  # 本来就是最新，不用动
+            try:
+                _old.handler = _new_h
+                # schema 同步：老 req 的代理是构建时拷的字段，一并刷新，
+                # 免得参数过滤按旧 schema 吃掉新参数。
+                for _fld in ("description", "parameters"):
+                    try:
+                        _v = getattr(_new, _fld, None)
+                        if _v is not None:
+                            setattr(_old, _fld, _v)
+                    except Exception:
+                        pass
+                if self._fn_identity(getattr(_old, "handler", None)) is self._fn_identity(_new_h):
+                    swapped += 1
+                else:
+                    stale.append(_name)
+            except Exception:
+                stale.append(_name)
+
+        total = len(captured)
+        parts = [f"\n🫀 就地换血：{swapped}/{total} 个工具 handler 已就地指向新代码"]
+        if swapped:
+            parts.append("→ 本条消息里的下一条工具调用即用新版，无需再开口")
+        if stale:
+            parts.append(
+                f"\n   ⚠️ {len(stale)} 个替换后身份仍不一致：{', '.join(stale[:5])}"
+            )
+        return "".join(parts)
 
     # ─────────────────────────────────────────
     # 工具方法
@@ -585,6 +692,10 @@ class PluginManager(Star):
         # sys.modules 里已缓存的子模块不会被清（核心的模块名前缀匹配与运行时
         # 模块名对不上），导致 router.py/dispatch.py/memory.py 这类拆分子模块的
         # 改动“重载成功但代码不生效”。这里按内部名/文件路径精确挖掉，强制重读盘。
+        # 重载前把 llm_tools 里属于本插件的 tool 对象抓在手里。这批旧对象正被
+        # 「已经构建好的 req.func_tool」内层引用着，而下面 _evict_plugin_bindings
+        # 会把它们从 func_list 摘走 —— 摘走之后就再也找不回来，所以先留底。
+        live_tools = self._capture_live_tools(plugin_key) if plugin_key else {}
         purged, module_snapshot = [], {}
         if plugin_key:
             purged, module_snapshot = self._purge_plugin_modules(plugin_key)
@@ -684,13 +795,17 @@ class PluginManager(Star):
             core_stale = self._scan_unapplied_core_changes()
         except Exception:
             core_stale = []
-        # 重载成功 → 登记待复核，下一个 on_llm_request 到来时把工具表里残留的
-        # 旧 handler 就地换掉（不必等对方再开口）。
-        if success and plugin_key:
+        # ── 重载当场就地换血（2026-09-25，替代 on_llm_request 钩子）──
+        # 光把新代码 import 进来不够：本轮对话的 req.func_tool 早已构建好，里面
+        # 的代理内层指着重载前那批 tool 对象，换不掉它们，这一整轮就继续跑旧
+        # 代码（假绿的通道）。core 执行链是实时读属性的，所以把旧对象上的
+        # handler 就地换成新对象那份，本条消息里的下一条工具调用立刻就是新版。
+        swap_note = ""
+        if plugin_key and success:
             try:
-                self._pending_swap[str(plugin_key).strip().lower()] = True
-            except Exception:
-                pass
+                swap_note = self._swap_live_handlers(live_tools, plugin_key)
+            except Exception as _sw_e:
+                swap_note = f"\n🫀 就地换血异常：{type(_sw_e).__name__}: {_sw_e}"
         try:
             # 2026-09-16 00:10 ⑤ 层生效度：stale 检测插件类方法是否真换血（avoid false green）
             grade_note = self._grade_reload_effect(
@@ -698,36 +813,11 @@ class PluginManager(Star):
             )
         except Exception as _g_e:
             grade_note = f"\n⚠️ 生效度评分异常：{type(_g_e).__name__}: {_g_e}"
-        # 钩子自检：注册这条路径不打日志，不自己查一遍就是又一个盲区。
-        hook_note = self._audit_hook_registered()
         return (
-            receipt + rebind_note + handover_note
-            + reclaim_note + live_note + grade_note + hook_note
+            receipt + rebind_note + swap_note + handover_note
+            + reclaim_note + live_note + grade_note
         )
 
-    def _audit_hook_registered(self) -> str:
-        """核对本插件的 on_llm_request 钩子有没有真正进注册表。
-
-        【为何要这一道】钩子注册走 get_handler_or_create，那函数不打日志，
-        所以「注册成功」在日志里没有任何痕迹。而这一层钩子恰恰承担着
-        「重载后无需等待」的责任，它掉线了外面看不出来——又是一次沉默的假绿。
-        这里直接查注册表要坐标：模块名对得上、方法名对得上，就算挂上了。
-        """
-        try:
-            from astrbot.core.star.star_handler import star_handlers_registry as _reg
-
-            names = {
-                str(getattr(_md, "handler_name", "") or "")
-                for _md in (_reg.get_handlers_by_module_name(__name__) or [])
-            }
-            if "_sync_stale_handlers" in names:
-                return "\n🪝 钩子自检：on_llm_request 已注册，重载后本轮即可换血"
-            return (
-                "\n🪝 钩子自检：⚠️ on_llm_request 未在注册表中"
-                f"（本模块现有 handler：{sorted(names) or '无'}）"
-            )
-        except Exception as _e:
-            return f"\n🪝 钩子自检：⚠️ 查询失败 {type(_e).__name__}: {_e}"
 
     def _purge_plugin_modules(self, plugin_key: str):
         """把插件自身及其子模块从 sys.modules 里挖掉，强制下次 import 重读盘。

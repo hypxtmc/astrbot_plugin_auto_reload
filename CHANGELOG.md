@@ -1,5 +1,19 @@
 # 更新记录
 
+## 1.4.0（2026-09-25）
+
+撤掉 1.3.0 的 `on_llm_request` 就地换血，改在重载当场换。那一版实测从未生效——全量日志里「换血成功」与「复核 N 个工具」出现 0 次，两处硬伤都在。
+
+一是时机不对。core 的 `OnLLMRequestEvent` 每条消息只触发一次，位置在工具表刚构建完、任何工具都还没调的那一刻；而重载发生在消息处理中途，那时钩子早已跑过，这一轮再没有第二次触发机会，「本轮即可换血」在时序上不成立。二是归属断了。待换登记写在 `self._pending_swap` 这个实例属性上，重载会把插件实例整个换掉，新实例那张表是空的——写的人和读的人不是同一个实例，登记等于扔进水里。
+
+新做法抓的是真病灶。core 的执行链全程实时读属性，不是快照：`tool_loop_agent_runner` 每次调用都 `req.func_tool.get_tool(name)` 现查，`FunctionToolExecutor._execute_local` 里 `if tool.handler:` 现读，`_PermissionGuardedTool.call` 里 `self._wrapped.handler` 现读。真正被冻住的只有 `req.func_tool` 里那批 tool 对象引用，本轮构建后不再变。所以重载前先把 `llm_tools.func_list` 里属于本插件的 tool 对象抓到手里（必须在摘除之前——`_evict_plugin_bindings` 会把它们 remove 掉），重载后原地把旧对象上的 `handler` 换成新对象那份，并按需同步 `description` / `parameters`。只动属性、不换对象，这一点是关键：`req.func_tool` 里代理的内层指的正是这批旧对象，对象一换就指不到了。
+
+随之撤掉 `_audit_hook_registered`、`on_llm_request` 钩子、`_pending_swap` / `_handler_hooked` 两个属性、`_unwrap_handler` / `_rewrap_handler` 两个辅助；新增 `_tool_belongs`、`_fn_identity`、`_capture_live_tools`、`_swap_live_handlers`。回执新增 `🫀 就地换血：N/M 个工具 handler 已就地指向新代码`，换完当场比对新旧 handler 的底层函数对象身份，不靠「等下次调用看看」，也不靠被重载的代码自己开口。
+
+实机验证用的是探针法：先往磁盘写入一段只存在于新代码里的回执标记（**不重载**），再发起重载——第一次调用的回执不带该标记（执行者仍是重载前那份代码），而**同一条消息内紧接着的第二次调用，回执里就带上了标记**。当场换血成立，不需要等下一轮，也不需要对方再开口。
+
+同一轮里接着又揪出一处更隐蔽的：本轮那个对象只在 loop 开头从 `func_list` 取过一次，第一次重载后 core 就把 `func_list` 换成了新对象——第二次重载起再按 `func_list` 抓，抓到的都是本轮根本用不到的新一代，回执照样写「已换血」，而本轮仍在跑旧代码，又是一次假绿。所以活对象台账必须跨重载存活：挂在 core 的 `llm_tools` 单例上（插件模块会被整个换掉，模块级变量存不住），按对象堆表而不是按名字只留一个（多会话并发时各 loop 攥的是不同代的对象），超上限裁掉最老的。`FunctionTool` 是 pydantic dataclass，没开 `weakref_slot`，挂不了弱引用，所以没用 `WeakSet`。
+
 ## 1.3.0（2026-09-25）
 
 新增 `on_llm_request` 就地换血。工具 handler 在对话轮开头被收集成快照，此后同一轮里拿到的都是那批旧函数对象，所以先前每次重载都只能等下一轮才能确认生效。core 的顺序是 `build_main_agent` 先填好 `req.func_tool`，再触发 `OnLLMRequestEvent`，最后才交给 provider——本钩子正插在填好与交付之间。在里面按 `handler_module_path` 从 handler 注册表取最新 handler，与工具表里那个比底层函数对象身份，不同就用同构的 `functools.partial` 换掉，本次调用即用新代码。
