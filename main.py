@@ -529,6 +529,11 @@ class PluginManager(Star):
             yield event.plain_result(f"❌ 找不到插件「{name}」")
             return
 
+        # ── 在飞任务守卫（2026-09-26）── 与工具路径同一判据，先读后 purge
+        _in_flight = self._scan_in_flight(star.name)
+        if _in_flight:
+            yield event.plain_result(self._in_flight_refusal(star.name, _in_flight))
+            return
         try:
             pm = self._get_pm()
             purged, _snapshot = self._purge_plugin_modules(star.name)
@@ -751,6 +756,11 @@ class PluginManager(Star):
         # 重载前把 llm_tools 里属于本插件的 tool 对象抓在手里。这批旧对象正被
         # 「已经构建好的 req.func_tool」内层引用着，而下面 _evict_plugin_bindings
         # 会把它们从 func_list 摘走 —— 摘走之后就再也找不回来，所以先留底。
+        # ── 在飞任务守卫（2026-09-26）── 必须在 _purge_plugin_modules 之前读：
+        # purge 一跑，模块连同 IN_FLIGHT_DISPATCHES 一起消失，守卫就成了摆设。
+        in_flight = self._scan_in_flight(plugin_key) if plugin_key else 0
+        if in_flight:
+            return self._in_flight_refusal(plugin_key, in_flight)
         live_tools = self._capture_live_tools(plugin_key) if plugin_key else {}
         purged, module_snapshot = [], {}
         if plugin_key:
@@ -874,6 +884,69 @@ class PluginManager(Star):
             + reclaim_note + live_note + grade_note
         )
 
+
+    def _scan_in_flight(self, plugin_key: str) -> int:
+        """数目标插件此刻在飞的子代理任务（重载守卫用，2026-09-26）。
+
+        约定：插件只要在任一子模块暴露模块级 `IN_FLIGHT_DISPATCHES`（int），
+        即自动参与守卫。零耦合——不 import 目标插件、不碰它的实例，只读
+        `sys.modules` 里的模块属性。
+
+        匹配口径与 `_purge_plugin_modules` 逐字一致（段名相等 或 __file__ 路径
+        含 key）。口径必须一致，否则守卫会静默失效：`plugin_key` 是 star 内部
+        名（如 "parallel_handoff"），而运行时模块名是
+        "astrbot_plugin_parallel_handoff"，按 `data.plugins.{key}` 拼前缀是对不上号的。
+
+        调用时机必须在 `_purge_plugin_modules` 之前——purge 一跑，模块连同
+        计数一起没了，守卫就成了摆设。
+
+        为何不用 core 的 `_ACTIVE_AGENT_RUNNERS`：它记的是「哪个会话有 agent
+        在跑」，粒度是会话。2026-09-26 那次事故里，dispatch 与发起重载同属一个
+        会话同一条对话线，按会话判会把发起方自己也拦下，工具直接废掉。
+        """
+        import sys as _sys
+
+        key = str(plugin_key or "").strip().lower()
+        if not key:
+            return 0
+        exact = None  # 有复合约定的插件：用它的值（已含后台任务）
+        rough = 0     # 只有裸 int 计数的插件：累加
+        for mod_name, mod in list(_sys.modules.items()):
+            if mod is None:
+                continue
+            hit = any(seg.lower() == key for seg in mod_name.split("."))
+            if not hit:
+                f = getattr(mod, "__file__", None)
+                if f and key in str(f).replace("\\", "/").lower():
+                    hit = True
+            if not hit:
+                continue
+            # 约定一：IN_FLIGHT_COUNT() ——可调用，返回复合在飞数
+            # （同步 dispatch + 后台任务表）。优先，且不再叠加裸计数。
+            fn = getattr(mod, "IN_FLIGHT_COUNT", None)
+            if callable(fn):
+                try:
+                    n = fn()
+                except Exception:
+                    n = None
+                if isinstance(n, int) and n > 0:
+                    exact = (exact or 0) + n
+                continue
+            # 约定二（退路）：模块级 int 计数
+            n = getattr(mod, "IN_FLIGHT_DISPATCHES", 0)
+            if isinstance(n, int) and n > 0:
+                rough += n
+        return exact if exact is not None else rough
+
+    @staticmethod
+    def _in_flight_refusal(plugin_key: str, n: int) -> str:
+        """在飞任务守卫的拒绝回执（工具路径与命令路径共用文案）。"""
+        return (
+            f"⏸ 已延后：**{plugin_key}** 此刻有 {n} 个子代理任务在飞。\n"
+            f"现在重载会触发 Terminating，把在飞协程连回复一起掐掉"
+            f"（2026-09-26 实证：回复永久丢失，无报错、无超时文案，用户侧一片空白）。\n"
+            f"等这轮跑完再调一次即可——不是故障，是有意拦的。"
+        )
 
     def _purge_plugin_modules(self, plugin_key: str):
         """把插件自身及其子模块从 sys.modules 里挖掉，强制下次 import 重读盘。
