@@ -2415,7 +2415,8 @@ class PluginManager(Star):
         if existing is not None:
             # persona_prompt 提供且与现值不同 → 更新既有人格（否则改人格只能靠删了重建）
             if persona_prompt:
-                cur_prompt = None
+                cur_prompt = None  # DB 现值（get_all_personas 回源 DB）
+                mem_prompt = None  # 人格管理器内存副本——reload 时真正吃的那份
                 _diag = []
                 try:
                     allp = await mgr.get_all_personas()
@@ -2425,15 +2426,26 @@ class PluginManager(Star):
                             cur_prompt = getattr(p, "system_prompt", None)
                             if cur_prompt is None and isinstance(p, dict):
                                 cur_prompt = p.get("system_prompt")
-                            _diag.append(f"matched len={len(cur_prompt) if cur_prompt else 0}")
+                            _diag.append(f"db_len={len(cur_prompt) if cur_prompt else 0}")
                             break
                 except Exception as _e:
                     _diag.append(f"ERR {type(_e).__name__}:{_e}")
-                logger.info(f"[子代理热更新] 更新人格诊断 {persona_id}: {'; '.join(_diag)}; new_len={len(persona_prompt)}; will_update={cur_prompt is not None and cur_prompt != persona_prompt}")
-                if cur_prompt is not None and cur_prompt != persona_prompt:
+                # 只比 DB 不够：直改 DB 会绕过内存副本，reload 后运行时仍是旧人格（2026-09-29 坑）
+                try:
+                    _v3 = mgr.get_persona_v3_by_id(persona_id)
+                    if _v3:
+                        mem_prompt = str(_v3.get("prompt", "") or "")
+                        _diag.append(f"mem_len={len(mem_prompt)}")
+                except Exception as _e:
+                    _diag.append(f"memERR {type(_e).__name__}:{_e}")
+                need_update = (cur_prompt is not None and cur_prompt != persona_prompt) or (
+                    mem_prompt is not None and mem_prompt != persona_prompt
+                )
+                logger.info(f"[子代理热更新] 更新人格诊断 {persona_id}: {'; '.join(_diag)}; new_len={len(persona_prompt)}; will_update={need_update}")
+                if need_update:
                     await mgr.update_persona(persona_id, system_prompt=persona_prompt)
                     from astrbot.api import logger as _lg2
-                    _lg2.info(f"[子代理热更新] 已更新人格 {persona_id} 的 system_prompt")
+                    _lg2.info(f"[子代理热更新] 已更新人格 {persona_id} 的 system_prompt（DB+内存）")
             return False, existing
         # 创建
         prompt = persona_prompt or description or f"你是{persona_id}。"
@@ -2604,6 +2616,11 @@ class PluginManager(Star):
             if not agents:
                 return f"未找到子代理「{name}」"
 
+        try:
+            _all_db = await pm.get_all_personas()
+        except Exception:
+            _all_db = []
+
         lines, bad = [], 0
         for a in agents:
             n = str(a.get("name", "")).strip()
@@ -2630,6 +2647,18 @@ class PluginManager(Star):
                     rt_prompt = str(getattr(h.agent, "instructions", "") or "").strip()
                     if src_prompt and rt_prompt and src_prompt != rt_prompt:
                         issues.append("运行时 instructions 与人格源不一致（改人格后未重载，旧代码在跑）")
+                    # 人格源本身可能就是陈旧的内存副本：直改 DB 不刷新它，四层会「假一致」
+                    _dbp = None
+                    for _x in _all_db:
+                        if getattr(_x, "persona_id", None) == pid:
+                            _dbp = _x
+                            break
+                    _db_prompt = str(getattr(_dbp, "system_prompt", "") or "").strip() if _dbp is not None else ""
+                    if _db_prompt and src_prompt and _db_prompt != src_prompt:
+                        issues.append(
+                            f"人格内存副本与 DB 不一致（内存 {len(src_prompt)} 字 / DB {len(_db_prompt)} 字）"
+                            "—— 直改 DB 不刷内存，走 update_subagent(upsert, persona_prompt=…) 重推"
+                        )
                 _pv = str(getattr(h, "provider_id", "") or "").strip()
                 if prov and _pv != prov:
                     issues.append(f"运行时 provider({_pv or '默认'}) 与编制表({prov}) 不一致")
@@ -2783,12 +2812,13 @@ class PluginManager(Star):
         return f"错误：未知 action「{act}」（应为 save/list/rollback）"
 
     @filter.llm_tool(name="subagent_test")
-    async def _llm_subagent_test(self, event, name: str, message: str) -> str:
+    async def _llm_subagent_test(self, event, name: str, message: str, full: bool = False) -> str:
         """子代理试音台：用该子代理的人格与 provider 直接发一条测试消息，拿回原始回复（不转发给用户）。调人格时改一段试一段。
 
         Args:
             name (string): 子代理名。
             message (string): 发给子代理的测试消息。
+            full (boolean): 是否返回完整回复（默认仅显示前 600 字，评测长文时传 true）。
         """
         if not self.config.get("enable_subagent_tools", True):
             return "子代理工具已在插件配置中关闭（enable_subagent_tools），可在插件配置页开启"
@@ -2800,6 +2830,7 @@ class PluginManager(Star):
             return "权限不足：仅管理员或配置的所有者可调用"
 
         import asyncio as _aio
+        import secrets as _secrets
         from datetime import datetime as _dt
 
         name = str(name).strip()
@@ -2823,7 +2854,7 @@ class PluginManager(Star):
         if provider is None:
             return f"错误：provider「{prov_id or '默认'}」不可用"
 
-        session_id = f"subagent_test_{name}_{_dt.now().strftime('%Y%m%d%H%M%S')}"
+        session_id = f"subagent_test_{name}_{_dt.now().strftime('%Y%m%d%H%M%S%f')}_{_secrets.token_hex(4)}"
         try:
             completion = await _aio.wait_for(
                 provider.text_chat(
@@ -2840,7 +2871,8 @@ class PluginManager(Star):
         text = str(getattr(completion, "completion_text", "") or "").strip()
         if not text:
             text = "（空回复）"
-        shown = text if len(text) <= 600 else text[:600] + f"…（共 {len(text)} 字）"
+        _limit = 20000 if full else 600
+        shown = text if len(text) <= _limit else text[: _limit] + f"…（共 {len(text)} 字）"
         return f"🎤 {name} 试音回复（provider={prov_id or '默认'}）：\n{shown}"
 
     async def terminate(self):
