@@ -305,11 +305,11 @@ class PluginManager(Star):
         if not key:
             return ""
         if not captured:
-            return "\n🫀 就地换血：本插件未注册 llm_tool，无需换血"
+            return "无需换血"
         try:
             from astrbot.core.provider.register import llm_tools as _lt
         except Exception as _e:
-            return f"\n🫀 就地换血：⚠️ 取不到 llm_tools：{type(_e).__name__}: {_e}"
+            return f"⚠️ 就地换血异常：{type(_e).__name__}: {_e}"
 
         old_ids = {id(_o) for _o in captured}
         fresh: dict = {}
@@ -358,24 +358,19 @@ class PluginManager(Star):
         # 72/73，看着像有一个没换成功，是假红（2026-09-25 实测复现）。所以分开报。
         total = len(captured)
         offline = total - swapped - len(stale)
-        parts = [f"\n🫀 就地换血：{swapped}/{total - offline} 个工具 handler 已就地指向新代码"]
-        if offline > 0:
-            parts.append(f"｜另有 {offline} 个历史对象对应的工具已下线，跳过")
-        if swapped:
-            parts.append("\n→ 本条消息里的下一条工具调用即用新版 handler")
-            # 【保守承诺】换血覆盖的是 llm_tools 里各 tool 对象的 .handler；而工具
-            # 描述与参数 schema 是注册时解析好、存在 tool 对象上的，本轮 loop 开头
-            # 那份快照还是旧的。要让「完全」（连描述和 schema 一起）落到用户眼前，
-            # 最稳的是让他再说一句话、开一个新 loop —— 2026-09-25 经反馈写进回执。
-            parts.append(
-                "\n→ 要确保「完全」重载（工具描述与参数 schema 一并刷新），"
-                "让用户再说一句话触发新 loop 最稳妥"
-            )
         if stale:
-            parts.append(
-                f"\n   ⚠️ {len(stale)} 个替换后身份仍不一致：{', '.join(stale[:5])}"
+            # 替换后身份仍不一致：假绿的硬信号，单独成行
+            return (
+                f"🚨 换血不完整：{len(stale)} 个 handler 替换后身份仍不一致"
+                f"（{', '.join(stale[:5])}）"
             )
-        return "".join(parts)
+        if not swapped and not offline:
+            return ""
+        # 成功只报一条计数；「本轮 schema 是旧的、要让用户再说一句」这类知识
+        # 写进 astrbot_ops 技能卡，不占每次回执的行（2026-09-29 精简）。
+        return f"换血 {swapped}/{total - offline}" + (
+            f"（{offline} 个工具已下线，跳过）" if offline > 0 else ""
+        )
 
     # ─────────────────────────────────────────
     # 工具方法
@@ -729,9 +724,9 @@ class PluginManager(Star):
         """热重载任意 AstrBot 插件（重载后插件代码立即生效，返回值自带验证回执）。
 
         Args:
-            name (string): 插件名（可传 all 表示全部）。支持内部名/展示名/目录名/序号（从 plugin_list 输出取序）。传错时回执会直接给出内部名候选。
-            handover_platforms (boolean): 二期能力，默认 False。开启后在该插件重载完成后，停掉它持有的旧平台适配器实例、按新代码重挂（治「平台适配器型」插件重载后仍走旧代码）。代价是通道断线重连约 1-3 秒，期间消息可能丢，仅在确实需要换血时开启。
-            reclaim_tasks (boolean): 三期能力，默认 False。开启后取消该插件自己 create_task 起、且仍跑旧代码的后台任务（定时器/巡检/重试循环这类，不经平台注册、二期收不走）。只杀「持旧模块代码」的任务，新任务不受影响。适合插件自起后台循环的场合；不确定时可先只开 handover_platforms，看回执里 🧬 那行再定。
+            name (string): 插件名，或 all 表示全部。认内部名/展示名/目录名/序号；传错时回执直接给候选。
+            handover_platforms (boolean): 默认 False。true 则重载后停掉该插件的旧平台适配器实例、按新代码重挂（治「适配器型插件仍跟旧代码」），代价是通道断线重连 1~3 秒，期间消息可能丢。
+            reclaim_tasks (boolean): 默认 False。true 则取消该插件自建、且仍持旧模块代码的后台任务（定时器/巡检/重试循环）。只杀旧代码任务，新任务不动；不确定就先只开 handover_platforms。
         """
         try:
             allowed = event.is_admin() if hasattr(event, "is_admin") else False
@@ -879,10 +874,23 @@ class PluginManager(Star):
             )
         except Exception as _g_e:
             grade_note = f"\n⚠️ 生效度评分异常：{type(_g_e).__name__}: {_g_e}"
-        return (
-            receipt + rebind_note + swap_note + handover_note
-            + reclaim_note + live_note + grade_note
-        )
+        notes = [rebind_note, swap_note, handover_note, reclaim_note, live_note, grade_note]
+        brief, verbose = [], []
+        for _n in notes:
+            _t = (_n or "").strip()
+            if not _t:
+                continue
+            # 单行且不带警报符号的：归并成一行（成功路径常绿不刷屏）；
+            # 带 ⚠️/🚨/❌ 或多行的：原样单独展开，异常细节一个不丢。
+            if "\n" in _t or any(_k in _t for _k in ("⚠️", "🚨", "❌", "◐")):
+                verbose.append(_t)
+            else:
+                brief.append(_t)
+        out = [receipt]
+        if brief:
+            out.append("｜".join(brief))
+        out.extend(verbose)
+        return "\n".join(out)
 
 
     def _scan_in_flight(self, plugin_key: str) -> int:
@@ -1455,7 +1463,7 @@ class PluginManager(Star):
                 f"\n🚨 必须重启：Mixin 的类对象热重载换不掉，重启后才能真正生效"
             )
         if not (done_tools or done_handlers or done_self or failed):
-            return "\n🔗 绑定自检：全部指向当前在线模块，无孤儿"
+            return "绑定无孤儿"
 
         parts = []
         if done_self:
@@ -1793,7 +1801,7 @@ class PluginManager(Star):
         stale_adapters = list(dict.fromkeys(stale_adapters))
 
         if not stale_tasks and not stale_adapters:
-            return "\n🧬 长活对象自检：无陈旧引用（后台任务/平台适配器均指向当前在线模块）"
+            return "长活无陈旧"
 
         parts = []
         if stale_tasks:
@@ -2200,13 +2208,13 @@ class PluginManager(Star):
         stale_lines = bool(core_stale)
         live_dirty = bool(live_note) and "⚠️" in live_note
         if not success:
-            head = "🧭 生效度：❌ 未生效（重载本身失败，见上方错误）"
+            head = "❌ 未生效（重载本身失败）"
         elif stale_lines:
-            head = "🧭 生效度：⚠️ 插件层面已换血，但底层有改动没进内存"
+            head = "⚠️ 插件已换血，但 core 有改动没进内存"
         elif live_dirty:
-            head = "🧭 生效度：◐ 部分生效——注册表已换血，长活链路仍持旧代码"
+            head = "◐ 部分生效：长活链路仍持旧代码"
         else:
-            head = "🧭 生效度：✅ 完全生效（模块/绑定/长活对象均指向当前代码）"
+            head = "生效 ✅ 完全"
         out = [head]
         # ── 2026-09-25 第五层换成硬判据：换代身份自检（对象 id 前后比对） ──
         # 原先两条是软判据，都依赖「被重载的代码自己开口」，等于向嫌犯本人取口供：
@@ -2222,94 +2230,70 @@ class PluginManager(Star):
                 # 判不了也必须开口：默认沉默＝回执看着全绿而自检压根没跑成，
                 # 这正是「沉默的假绿」，比误报更难查。
                 out.append(
-                    f"🔬 换代身份自检：⚠️ 无法判定——"
-                    f"{_id_r.get('why') or '未采到目标对象身份'}"
+                    f"⚠️ 换代身份自检无法判定：{_id_r.get('why') or '未采到目标对象身份'}"
                 )
             if _id_r.get("ok") is False:
-                head = (
-                    "🧭 生效度：⚠️ 部分生效——有对象没换代"
-                    "（即「假绿」，运行时验证未通过）"
-                )
-                out = [head]
-                out.append(f"   判据：{_id_r.get('detail') or '—'}")
-                out.append("🚨 必须重启：本次热重载没能换掉这些对象：")
-                for _s in _id_r.get("stale") or []:
-                    out.append(f"    · {_s}")
-                out.append(
-                    "🤖 请把这份结论原样通知用户/AI 操作者：插件已热重载但部分对象"
-                )
-                out.append(
-                    "    仍是旧版本，需要手动重启 AstrBot 后再重载一次，才能真正生效。"
-                )
-                return "\n" + "\n".join(out)
-            if _id_r.get("ok") is True:
-                out.append(f"🔬 换代身份自检：{_id_r.get('detail')}")
+                return "\n" + "\n".join([
+                    "🚨 假绿：有对象没换代，本次热重载没有真正生效",
+                    f"判据：{_id_r.get('detail') or '—'}",
+                    "未换代：" + "；".join((_id_r.get("stale") or [])[:6]),
+                    "需手动重启 AstrBot 后再重载一次——请原样转告用户。",
+                ])
+            # ok is True：自检通过就不刷存在感了，省掉固定那行（2026-09-29 精简）
             # MRO 复核：identity 只看模块/类/实例三层对象，MRO 上挂着的旧 Mixin
             # 基类若已不在注册表指向的位置，仍要单独抓出来（09-19 的盲区）。
             _mro_stale = self._audit_mro_stale(plugin_key)
             if _mro_stale:
-                head = (
-                    "🧭 生效度：⚠️ 部分生效——模块/绑定已换血，但运行时类方法仍是旧版本"
-                    "（即「假绿」，运行时验证未通过）"
-                )
-                out = [head]
-                out.append("🚨 必须重启：本次热重载没能把这些类方法换血成功：")
-                for _n in _mro_stale:
-                    out.append(
-                        f"    · {_n}：Mixin 类对象仍是旧版本"
-                        f"（方法体在子模块里，壳函数在 main.py 所以绑定自检查不到）"
-                    )
-                out.append(
-                    "🤖 请把这份结论原样通知用户/AI 操作者：插件已热重载但部分类方法"
-                )
-                out.append(
-                    "    使用旧代码，需要手动重启 AstrBot 后再重载一次，才能真正生效。"
-                )
-                return "\n" + "\n".join(out)
+                return "\n" + "\n".join([
+                    "🚨 假绿：运行时类方法仍是旧版本（Mixin 基类未换血，绑定自检看不到）",
+                    "未换血：" + "、".join(_mro_stale[:6]),
+                    "需手动重启 AstrBot 后再重载一次——请原样转告用户。",
+                ])
         if stale_lines:
             out.append(
-                "🚨 必须重启：astrbot/core 下有改动晚于本进程启动时刻，热重载带不进去——"
-                f"{', '.join(core_stale[:3])}"
-                + (f" 等 {len(core_stale)} 处" if len(core_stale) > 3 else "")
+                f"🚨 必须重启：astrbot/core 有 {len(core_stale)} 处改动晚于进程启动，"
+                f"热重载带不进去（{', '.join(core_stale[:3])}"
+                + ("…" if len(core_stale) > 3 else "") + "）"
             )
         elif live_dirty:
-            out.append("   长活链路要彻底换血，等二期换手能力上线（当前可暂不重启）")
+            out.append(
+                "  长活链路仍持旧代码：功能没变可先观察；要彻底换血就开"
+                " handover_platforms/reclaim_tasks，或重启"
+            )
         return "\n" + "\n".join(out)
 
     def _format_reload_receipt(self, plugin_key, target_all, success, error_message,
                                elapsed, before, after, log_lines, purged_count=0) -> str:
         """把一次热重载的结果整理成自证回执，省去事后翻日志"""
         label = "全部插件" if target_all else (plugin_key or "未知插件")
-        out = [f"{'✅ 热重载成功' if success else '❌ 热重载失败'} · {label}"]
-        meta = [f"耗时 {elapsed:.2f}s"]
+        out = [f"{'✅ 已重载' if success else '❌ 重载失败'} · {label}"]
+        meta = [f"{elapsed:.2f}s"]
         if not target_all:
             v0, v1 = before.get("version"), after.get("version")
             if v0 or v1:
-                meta.append(f"版本 {v0 or '—'} → {v1 or '—'}")
+                meta.append(f"{v0 or '—'}→{v1 or '—'}")
             if after:
-                meta.append("状态 🟢 已加载" if after.get("activated") else "状态 ⚪ 已禁用")
+                meta.append("已加载" if after.get("activated") else "已禁用")
             else:
-                meta.append("状态 ⚠️ 未在注册表中")
+                meta.append("⚠️ 不在注册表")
         if purged_count:
-            meta.append(f"模块缓存清理 {purged_count} 个")
-        else:
-            out.append(f"模块缓存：{getattr(self, '_last_purge_diag', '') or '无匹配'}")
-        meta.append(f"日志 {len(log_lines)} 行")
+            meta.append(f"清模块 {purged_count}")
+        elif getattr(self, "_last_purge_diag", ""):
+            meta.append("⚠️ 模块缓存未匹配")
         out.append("｜".join(meta))
         if error_message:
             out.append(f"错误：{str(error_message)[:300]}")
-
-        key_lines = []
-        for level, msg in log_lines:
-            low = msg.lower()
-            if any(h in low for h in _RELOAD_LOG_HINTS):
-                key_lines.append(f"[{level}] {msg.strip()[:160]}")
-        out.append(f"关键日志 {len(key_lines)} 条：")
-        if key_lines:
-            for line in key_lines[-8:]:
-                out.append("  · " + line)
-        else:
-            out.append("  · （无命中，建议人工复核）")
+        if not purged_count and getattr(self, "_last_purge_diag", ""):
+            out.append(f"  诊断：{str(self._last_purge_diag)[:200]}")
+        # 关键日志只在失败时附：成功时各段自检已自证，日志片段纯属刷屏（2026-09-29 精简）
+        if not success:
+            key_lines = [
+                f"[{level}] {msg.strip()[:160]}"
+                for level, msg in log_lines
+                if any(h in msg.lower() for h in _RELOAD_LOG_HINTS)
+            ]
+            out.append(f"关键日志 {len(key_lines)} 条：")
+            out.extend("  · " + ln for ln in (key_lines[-5:] or ["（无命中，建议人工复核）"]))
         return "\n".join(out)
 
     @filter.llm_tool(name="plugin_list")
