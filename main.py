@@ -141,7 +141,7 @@ def _plugin_name_hint(query, registry, reason: str = "") -> str:
     "astrbot_plugin_auto_reload",
     "hypxtmc",
     "在聊天中管理 AstrBot 插件：查看列表、启停、重载（含平台换手/陈旧任务回收/生效度评分）、安装、卸载、更新",
-    "1.4.2",
+    "1.4.3",
     "",
 )
 class PluginManager(Star):
@@ -1914,9 +1914,28 @@ class PluginManager(Star):
         stale = []
         gone = [m for m in _b_mods if m not in _a_mods]
         same = [m for m in _b_mods if _a_mods.get(m) == _b_mods[m]]
-        if gone:
+        # 2026-09-29 修误报：模块从 sys.modules 消失 ≠ 旧代码还活着。
+        # 函数内延迟 import 的模块（如 dispatch.py 里才 import 的 subagent_hooks）
+        # 本就不常驻表内，重载后不在表里恰恰说明清理干净——旧版一律算「未换代」，
+        # 于是每次重载都弹一条假的「需手动重启 AstrBot」。
+        # 真旧血由两条硬判据兜底（MRO 上挂旧模块的类 / handler 的 __globals__ 指向旧模块），
+        # 这里只对「已卸载但仍被引用」的模块报警：引用计数高于快照自身持有的基线才算。
+        import sys as _sys
+        live_gone = []
+        for _m in gone:
+            _obj = _b_mods.get(_m)
+            if _obj is None:
+                continue
+            try:
+                # 基线 3：快照 dict 一份 + 局部变量一份 + getrefcount 实参一份
+                if _sys.getrefcount(_obj) > 3:
+                    live_gone.append(_m)
+            except Exception:  # noqa: BLE001
+                live_gone.append(_m)   # 判不了就保守上报
+        if live_gone:
             stale.append(
-                f"模块层：{len(gone)} 个模块重载后已不在 sys.modules（{gone[0]} 等）"
+                f"模块层：{len(live_gone)} 个模块已卸载但仍有活引用"
+                f"（{live_gone[0].rsplit('.', 1)[-1]} 等）"
             )
         if same:
             stale.append(
@@ -2510,15 +2529,23 @@ class PluginManager(Star):
             # 已存在（并发/DB有但内存缺），再查一次
             return False, mgr.get_persona_v3_by_id(persona_id)
 
-    _subagent_write_lock = None
+    @staticmethod
+    def _get_subagent_write_lock(ctx):
+        """子代理配置写锁：save_config 是读-改-写，无锁并发会互相覆盖（2026-09-29）
 
-    @classmethod
-    def _get_subagent_write_lock(cls):
-        """子代理配置写锁：save_config 是读-改-写，无锁并发会互相覆盖（2026-09-29）"""
-        if cls._subagent_write_lock is None:
-            import asyncio as _aio
-            cls._subagent_write_lock = _aio.Lock()
-        return cls._subagent_write_lock
+        锁挂 context、不挂类属性：热重载会换掉类对象，类属性锁随之换成新的，
+        旧持锁者与新申请者各拿一把锁——等于没锁（2026-09-29 审查实锤）。
+        context 跨热重载存活，拿到的才是同一把。
+        """
+        import asyncio as _aio
+        lock = getattr(ctx, "_subagent_write_lock", None)
+        if lock is None:
+            lock = _aio.Lock()
+            try:
+                ctx._subagent_write_lock = lock
+            except Exception:  # noqa: BLE001
+                pass
+        return lock
 
     @filter.llm_tool(name="update_subagent")
     async def _llm_update_subagent(self, event, action: str, name: str = "",
@@ -2578,21 +2605,23 @@ class PluginManager(Star):
             return ("未做任何改动：persona_prompt 与 public_description 都为空。"
                     "改人格传全文或 file:<插件数据目录下的 md>；改路由描述传 public_description。")
 
-        cfg = self._get_orch_config()
-        agents = cfg.get("agents", [])
-        if not isinstance(agents, list):
-            agents = []
-
         if act == "remove":
-            before = len(agents)
-            agents = [a for a in agents if not (isinstance(a, dict) and a.get("name") == name)]
-            if len(agents) == before:
-                return f"未找到子代理「{name}」，无需移除"
-            async with self._get_subagent_write_lock():
-                cfg["agents"] = agents
-                self.context._config["subagent_orchestrator"] = cfg
+            async with self._get_subagent_write_lock(self.context):
+                # 锁内重读配置 + 逐条拷 entry：锁外快照会和并发改动互相覆盖
+                # （2026-09-29 审查：读-改必须在锁内，否则后写者全量覆盖前者）
+                _cfg = self._get_orch_config()
+                _agents = [
+                    dict(a) if isinstance(a, dict) else a
+                    for a in (_cfg.get("agents") or [])
+                ]
+                before = len(_agents)
+                _agents = [a for a in _agents if not (isinstance(a, dict) and a.get("name") == name)]
+                if len(_agents) == before:
+                    return f"未找到子代理「{name}」，无需移除"
+                _cfg["agents"] = _agents
+                self.context._config["subagent_orchestrator"] = _cfg
                 self.context._config.save_config()
-                await orch.reload_from_config(cfg)
+                await orch.reload_from_config(_cfg)
             return f"✅ 已移除子代理「{name}」并即时生效"
 
         if act != "upsert":
@@ -2637,22 +2666,28 @@ class PluginManager(Star):
                 if k in config:
                     entry[k] = config[k]
 
-        # upsert：按 name 匹配更新，否则追加
-        replaced = False
-        for i, a in enumerate(agents):
-            if isinstance(a, dict) and a.get("name") == name:
-                merged = dict(a)
-                merged.update(entry)
-                # persona_prompt 无意义时不覆盖既有 public_description
-                agents[i] = merged
-                replaced = True
-                break
-        if not replaced:
-            entry.setdefault("public_description", "")
-            entry.setdefault("provider_id", "opencode-go/mimo-v2.5")  # 仅新建时兑底
-            agents.append(entry)
-
-        async with self._get_subagent_write_lock():
+        # upsert：按 name 匹配更新，否则追加 —— 读-改-写整段在锁内，锁内重读配置
+        # （2026-09-29 审查：旧版在锁外就地改列表本体、中间又隔着 await，
+        #   两路并发可复现「后写者全量覆盖前者」「已移除的角色被复活」）
+        async with self._get_subagent_write_lock(self.context):
+            cfg = self._get_orch_config()
+            agents = [
+                dict(a) if isinstance(a, dict) else a
+                for a in (cfg.get("agents") or [])
+            ]
+            replaced = False
+            for i, a in enumerate(agents):
+                if isinstance(a, dict) and a.get("name") == name:
+                    merged = dict(a)
+                    merged.update(entry)
+                    # persona_prompt 无意义时不覆盖既有 public_description
+                    agents[i] = merged
+                    replaced = True
+                    break
+            if not replaced:
+                entry.setdefault("public_description", "")
+                entry.setdefault("provider_id", "opencode-go/mimo-v2.5")  # 仅新建时兑底
+                agents.append(entry)
             cfg["agents"] = agents
             self.context._config["subagent_orchestrator"] = cfg
             self.context._config.save_config()
@@ -2888,13 +2923,15 @@ class PluginManager(Star):
                     tools=p.get("tools") if p.get("tools") is not None else False,
                 )
                 restored += 1
-            async with self._get_subagent_write_lock():
+            async with self._get_subagent_write_lock(self.context):
                 self.context._config["subagent_orchestrator"] = orch_cfg
                 self.context._config.save_config()
-            orch = getattr(self.context, "subagent_orchestrator", None)
-            reloaded = "已重载运行时"
-            if orch is not None:
-                await orch.reload_from_config(orch_cfg)
+                # reload 也必须在锁内：否则并发的另一路 upsert 能插在
+                # 「落盘」与「reload」之间，运行时最终加载的不是本次落盘的内容
+                orch = getattr(self.context, "subagent_orchestrator", None)
+                reloaded = "已重载运行时"
+                if orch is not None:
+                    await orch.reload_from_config(orch_cfg)
             msg = (
                 f"✅ 已回滚到「{snapshot_name}」：编制表 {len(orch_cfg.get('agents', []))} 个子代理，"
                 f"人格恢复 {restored} 个，{reloaded}"
