@@ -2373,6 +2373,72 @@ class PluginManager(Star):
             "prompt 文件必须放在插件数据目录内（%s）：%s" % ("、".join(roots), rel)
         )
 
+    async def _persona_len_guard(self, persona_id: str, incoming: str) -> int:
+        """门禁用长度基线：DB 与内存副本取较大者（保守，防把新版缩水）"""
+        if str(incoming).startswith("file:"):
+            try:
+                with open(self._resolve_prompt_file(str(incoming)[5:].strip()), "r", encoding="utf-8") as _f:
+                    incoming = _f.read()
+            except OSError:
+                return 0
+        mgr = self._get_persona_mgr()
+        db_len = mem_len = 0
+        try:
+            for p in await mgr.get_all_personas():
+                if getattr(p, "persona_id", None) == persona_id:
+                    db_len = len(str(getattr(p, "system_prompt", "") or ""))
+                    break
+        except Exception:
+            pass
+        try:
+            v3 = mgr.get_persona_v3_by_id(persona_id)
+            if v3:
+                mem_len = len(str(v3.get("prompt", "") or ""))
+        except Exception:
+            pass
+        return max(db_len, mem_len)
+
+    async def _verify_subagent_write(self, name, pid, prompt, desc, provider_in, created) -> str:
+        """改后自检一行：内存=DB=传入 / provider 未漂移 / 描述非空（2026-09-29）"""
+        mgr = self._get_persona_mgr()
+        bits = []
+        cur = None
+        try:
+            for a in self._get_orch_config().get("agents", []):
+                if isinstance(a, dict) and a.get("name") == name:
+                    cur = a
+                    break
+        except Exception:
+            pass
+        try:
+            mem = ""
+            v3 = mgr.get_persona_v3_by_id(pid)
+            if v3:
+                mem = str(v3.get("prompt", "") or "")
+            db = ""
+            for p in await mgr.get_all_personas():
+                if getattr(p, "persona_id", None) == pid:
+                    db = str(getattr(p, "system_prompt", "") or "")
+                    break
+            if prompt:
+                ok = mem == prompt and db == prompt
+                bits.append(
+                    f"内存=DB=传入 {'✅' if ok else '❌'}（传入 {len(prompt)}｜内存 {len(mem)}｜DB {len(db)}）"
+                )
+            else:
+                ok = bool(mem) and mem == db
+                bits.append(f"内存=DB {'✅' if ok else '❌'}（{len(mem)} 字，本次未传 prompt）")
+        except Exception as _e:
+            bits.append(f"人格自检异常 ❌（{type(_e).__name__}）")
+        cur_prov = (cur or {}).get("provider_id") or ""
+        if provider_in:
+            bits.append(f"provider {'未漂移 ✅' if cur_prov == provider_in else '❌ 漂移'}（{cur_prov or '空'}）")
+        else:
+            bits.append(f"provider 未漂移 ✅（沿用 {cur_prov}）" if cur_prov else "provider ❌ 缺失")
+        cur_desc = (cur or {}).get("public_description") or ""
+        bits.append(f"描述非空 {'✅' if cur_desc.strip() else '❌ 空'}（{len(cur_desc)} 字）")
+        return "自检：" + "｜".join(bits)
+
     async def _ensure_persona(self, persona_id, persona_prompt=None, description=None):
         """确保 persona 存在于内存/DB，不存在则创建（可带 prompt）。返回 (existed, persona)"""
         # 支持 file: 前缀从文件读取 prompt——大 prompt 走 LLM 工具参数会被截断，必须走文件。
@@ -2444,25 +2510,37 @@ class PluginManager(Star):
             # 已存在（并发/DB有但内存缺），再查一次
             return False, mgr.get_persona_v3_by_id(persona_id)
 
+    _subagent_write_lock = None
+
+    @classmethod
+    def _get_subagent_write_lock(cls):
+        """子代理配置写锁：save_config 是读-改-写，无锁并发会互相覆盖（2026-09-29）"""
+        if cls._subagent_write_lock is None:
+            import asyncio as _aio
+            cls._subagent_write_lock = _aio.Lock()
+        return cls._subagent_write_lock
+
     @filter.llm_tool(name="update_subagent")
     async def _llm_update_subagent(self, event, action: str, name: str = "",
                                    persona_id: str = "",
                                    public_description: str = "",
                                    provider_id: str = "",
                                    persona_prompt: str = "",
-                                   config: dict = None) -> str:
+                                   config: dict = None,
+                                   force: bool = False) -> str:
         """热更新子代理（orchestrator + persona 联动）：
            action=upsert 新增/更新子代理；remove 移除；list 列出。
-           成功后即时生效，无需重启。
+           成功后即时生效，无需重启，返回值末尾附一行改后自检。
 
         Args:
             action (string): upsert | remove | list
             name (string): 子代理英文 id，如 agent_a
             persona_id (string): 中文人格名（默认同 name）。upsert 时若该人格不存在会自动创建。
-            public_description (string): 主代理路由描述（子代理用途/触发场景，给路由判断用）。
-            provider_id (string): 该子代理用的模型提供商 id（如 opencode-go/mimo-v2.5）。留空用默认。
-            persona_prompt (string): upsert 时写入系统人格 prompt。人格不存在则新建；已存在且内容有变化则更新（可借此修改人格设定）。
+            public_description (string): 主代理路由描述（子代理用途/触发场景，给路由判断用）。留空则保留原描述，不会清空。
+            provider_id (string): 该子代理用的模型提供商 id。留空沿用该 agent 现有值（新建时兑底默认），不会重置。
+            persona_prompt (string): upsert 时写入系统人格 prompt，大 prompt 走 file:<插件数据目录下的 md>。不传则人格一字不动。
             config (dict): 可选，额外 orchestrator 字段（如 enabled=false 禁用、tools 列表等）。
+            force (boolean): 默认 false。新 prompt 短于现值 60% 会被拒写，确认是有意精简才传 true。
         """
         if not self.config.get("enable_subagent_tools", True):
             return "子代理工具已在插件配置中关闭（enable_subagent_tools），可在插件配置页开启"
@@ -2495,6 +2573,11 @@ class PluginManager(Star):
         if not name:
             return "错误：name 不能为空"
 
+        # 空调用：什么都没传 → 明确回话，不许静默「成功」骗人（2026-09-29）
+        if act == "upsert" and not str(persona_prompt).strip() and not str(public_description).strip():
+            return ("未做任何改动：persona_prompt 与 public_description 都为空。"
+                    "改人格传全文或 file:<插件数据目录下的 md>；改路由描述传 public_description。")
+
         cfg = self._get_orch_config()
         agents = cfg.get("agents", [])
         if not isinstance(agents, list):
@@ -2505,29 +2588,49 @@ class PluginManager(Star):
             agents = [a for a in agents if not (isinstance(a, dict) and a.get("name") == name)]
             if len(agents) == before:
                 return f"未找到子代理「{name}」，无需移除"
-            cfg["agents"] = agents
-            self.context._config["subagent_orchestrator"] = cfg
-            self.context._config.save_config()
-            await orch.reload_from_config(cfg)
+            async with self._get_subagent_write_lock():
+                cfg["agents"] = agents
+                self.context._config["subagent_orchestrator"] = cfg
+                self.context._config.save_config()
+                await orch.reload_from_config(cfg)
             return f"✅ 已移除子代理「{name}」并即时生效"
 
         if act != "upsert":
             return f"错误：未知 action「{act}」（应为 upsert/remove/list）"
 
         pid = persona_id or name
-        # 确保人格存在
+        # 先把 file: 解析成正文：门禁、写入、自检统一用解析后的文本
+        resolved_prompt = str(persona_prompt or "")
+        if resolved_prompt.startswith("file:"):
+            try:
+                with open(self._resolve_prompt_file(resolved_prompt[5:].strip()), "r", encoding="utf-8") as _f:
+                    resolved_prompt = _f.read()
+            except OSError as _e:
+                return f"错误：无法读取 prompt 文件：{_e}"
+        # 截断门禁：新 prompt 短于现值 60% 直接拒写（2026-09-26 把 5061 字覆盖成 748 字的事故）
+        if resolved_prompt.strip():
+            _cur_len = await self._persona_len_guard(pid, resolved_prompt)
+            if _cur_len and len(resolved_prompt) < _cur_len * 0.6 and not force:
+                return (f"⛔ 拒绝写入：新 prompt {len(resolved_prompt)} 字，现值 {_cur_len} 字，"
+                        f"不足现值的 60%。若是有意精简，请再调一次并传 force=true；"
+                        f"若是贴了节选，请改传全文或 file:<路径>。人格与配置均未改动。")
+        # 确保人格存在（用解析后的正文，避免 file: 前缀被当成人格内容）
         created, _p = await self._ensure_persona(
-            pid, persona_prompt=persona_prompt or None,
+            pid, persona_prompt=resolved_prompt or None,
             description=public_description or None,
         )
 
+        # 只在显式传了值时才写这两个键：不传 = 保留既有值（provider 不被重置成默认，
+        # 描述不被清空。旧版无脑写 entry 会把 provider 打回默认值导致 403、把描述抹掉）
         entry = {
             "name": name,
             "persona_id": pid,
-            "public_description": public_description or "",
-            "provider_id": provider_id or "opencode-go/mimo-v2.5",
             "enabled": True,
         }
+        if str(public_description).strip():
+            entry["public_description"] = public_description
+        if str(provider_id).strip():
+            entry["provider_id"] = provider_id
         if isinstance(config, dict):
             # 合并 extra 字段（enabled/tools/remove... 仅保留合法键，避免污染）
             for k in ("enabled", "tools", "remove_main_duplicate_tools"):
@@ -2545,16 +2648,22 @@ class PluginManager(Star):
                 replaced = True
                 break
         if not replaced:
+            entry.setdefault("public_description", "")
+            entry.setdefault("provider_id", "opencode-go/mimo-v2.5")  # 仅新建时兑底
             agents.append(entry)
 
-        cfg["agents"] = agents
-        self.context._config["subagent_orchestrator"] = cfg
-        self.context._config.save_config()
-        await orch.reload_from_config(cfg)
+        async with self._get_subagent_write_lock():
+            cfg["agents"] = agents
+            self.context._config["subagent_orchestrator"] = cfg
+            self.context._config.save_config()
+            await orch.reload_from_config(cfg)
 
         who = "创建人格并" if created else ""
         act_word = "更新" if replaced else "新增"
-        return f"✅ 已{act_word}子代理「{name}」（{who}persona={pid}），即时生效"
+        selfcheck = await self._verify_subagent_write(
+            name, pid, resolved_prompt, str(public_description), str(provider_id), created
+        )
+        return f"✅ 已{act_word}子代理「{name}」（{who}persona={pid}），即时生效\n{selfcheck}"
     # ── 子代理三件套：体检 / 快照 / 试音 ──
 
     def _snapshot_dir(self) -> str:
@@ -2779,8 +2888,9 @@ class PluginManager(Star):
                     tools=p.get("tools") if p.get("tools") is not None else False,
                 )
                 restored += 1
-            self.context._config["subagent_orchestrator"] = orch_cfg
-            self.context._config.save_config()
+            async with self._get_subagent_write_lock():
+                self.context._config["subagent_orchestrator"] = orch_cfg
+                self.context._config.save_config()
             orch = getattr(self.context, "subagent_orchestrator", None)
             reloaded = "已重载运行时"
             if orch is not None:
