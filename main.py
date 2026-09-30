@@ -141,11 +141,11 @@ def _plugin_name_hint(query, registry, reason: str = "") -> str:
     "astrbot_plugin_auto_reload",
     "hypxtmc",
     "在聊天中管理 AstrBot 插件：查看列表、启停、重载（含平台换手/陈旧任务回收/生效度评分）、安装、卸载、更新",
-    "1.4.3",
+    "1.4.4",
     "",
 )
 class PluginManager(Star):
-    """自动重载 - 为 AI agent 设计的插件管理与自主热重载，人类也可用聊天指令操作"""
+    """自主热重载 - 为 AI agent 设计的插件管理与自主热重载，人类也可用聊天指令操作"""
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -3007,4 +3007,4 @@ class PluginManager(Star):
         return f"🎤 {name} 试音回复（provider={prov_id or '默认'}）：\n{shown}"
 
     async def terminate(self):
-        logger.info("[自动重载] 插件已卸载")
+        logger.info("[自主热重载] 插件已卸载")
